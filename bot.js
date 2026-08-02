@@ -140,9 +140,10 @@ function pareceConversaComum(texto) {
   return false;
 }
 
-// Usuário corrigindo a última refeição registrada (ex: "não era 2 ovos, era 1")
+// Usuário corrigindo a última refeição registrada - tanto quantidade errada
+// ("não era 2 ovos, era 1") quanto ingrediente errado ("não tinha repolho")
 const REGEX_CORRECAO =
-  /\b(na verdade|me enganei|errei|foi engano|não era|nao era|não foi|nao foi|corrige|corrigir|esquece,? era|desconsidera,? era)\b/i;
+  /\b(na verdade|me enganei|errei|foi engano|não era|nao era|não foi|nao foi|não tinha|nao tinha|não tem|nao tem|corrige|corrigir|esquece,? era|desconsidera,? era|tira o|tira a)\b/i;
 
 // Usuário perguntando se/quanto pode comer algo específico - tanto no
 // formato "quanto posso comer" quanto "posso comer X?" (permissão)
@@ -257,8 +258,61 @@ function textoBoasVindas(nome) {
 
 // Processa a resposta do usuário de acordo com a etapa atual do onboarding.
 // Retorna { resposta: string, perfil: object, precisaImagemDieta: bool }
+// Ordem das etapas da entrevista, usada pra poder "voltar" uma etapa se a
+// pessoa errou uma resposta anterior.
+const ORDEM_ETAPAS = ['objetivo', 'peso', 'altura', 'idade', 'sexo', 'atividade', 'tem_dieta'];
+
+// Usuário pedindo pra voltar/corrigir uma resposta anterior da entrevista
+const REGEX_VOLTAR_ETAPA = /^(voltar|corrigir|errei|espera|calma|quero corrigir|volta)\b/i;
+
+function perguntaDaEtapa(etapa) {
+  switch (etapa) {
+    case 'objetivo':
+      return (
+        '*Qual é o seu objetivo?*\n' +
+        '1️⃣ Emagrecer\n2️⃣ Ganhar massa muscular\n3️⃣ Manter o peso\n' +
+        '4️⃣ Só quero registrar o que como (sem meta)\n\nResponde só com o número.'
+      );
+    case 'peso':
+      return '⚖️ Qual é o seu *peso atual* em kg? (ex: 78)';
+    case 'altura':
+      return '📏 E a sua *altura*? Pode mandar em cm (ex: 175) ou metros (ex: 1,75)';
+    case 'idade':
+      return '🎂 Qual sua *idade*?';
+    case 'sexo':
+      return '🚻 *Sexo biológico* (usado só pra calcular seu gasto calórico com mais precisão):\n1️⃣ Masculino\n2️⃣ Feminino';
+    case 'atividade':
+      return (
+        '🏃 Qual seu *nível de atividade física*?\n\n' +
+        '1️⃣ Sedentário (pouco ou nenhum exercício)\n' +
+        '2️⃣ Leve (exercício 1-3x/semana)\n' +
+        '3️⃣ Moderado (exercício 3-5x/semana)\n' +
+        '4️⃣ Intenso (exercício 6-7x/semana)\n' +
+        '5️⃣ Muito intenso (atleta / 2x ao dia)'
+      );
+    case 'tem_dieta':
+      return (
+        '📋 Você já tem uma *dieta pronta* (de nutricionista, por exemplo) que quer usar como meta?\n\n' +
+        '1️⃣ Sim, vou mandar uma foto/print dela\n2️⃣ Não, calcula pra mim'
+      );
+    default:
+      return null;
+  }
+}
+
 async function processarOnboarding(perfil, texto, mensagem) {
   const t = (texto || '').trim();
+
+  // Deixa a pessoa voltar uma etapa se percebeu que errou uma resposta
+  // anterior, em vez de precisar refazer a entrevista inteira do zero.
+  if (REGEX_VOLTAR_ETAPA.test(t) && perfil.etapa !== 'aguardando_dieta') {
+    const indiceAtual = ORDEM_ETAPAS.indexOf(perfil.etapa);
+    if (indiceAtual > 0) {
+      perfil.etapa = ORDEM_ETAPAS[indiceAtual - 1];
+      return { resposta: `🔙 Sem problema! ${perguntaDaEtapa(perfil.etapa)}`, perfil };
+    }
+    return { resposta: `Você já está na primeira pergunta:\n\n${perguntaDaEtapa(perfil.etapa)}`, perfil };
+  }
 
   switch (perfil.etapa) {
     case 'objetivo': {
@@ -291,11 +345,13 @@ async function processarOnboarding(perfil, texto, mensagem) {
     }
 
     case 'altura': {
-      const altura = parseFloat(t.replace(',', '.').replace(/[^\d.]/g, ''));
+      let altura = parseFloat(t.replace(',', '.').replace(/[^\d.]/g, ''));
+      // Se a pessoa mandar em metros (ex: "1,72" ou "1.72"), converte pra cm
+      if (altura > 0 && altura < 3) altura = altura * 100;
       if (!altura || altura < 100 || altura > 250) {
-        return { resposta: '⚠️ Não entendi. Manda só o número, tipo: 175', perfil };
+        return { resposta: '⚠️ Não entendi. Manda em cm (ex: 175) ou metros (ex: 1,75)', perfil };
       }
-      perfil.altura_cm = altura;
+      perfil.altura_cm = Math.round(altura);
       perfil.etapa = 'idade';
       return { resposta: '🎂 Qual sua *idade*?', perfil };
     }
@@ -399,7 +455,10 @@ function montarResumoPerfil(perfil, primeiraVez) {
     `_Essa é uma estimativa geral, não substitui orientação de um nutricionista, ` +
     `principalmente se você tiver alguma condição de saúde._\n\n` +
     (primeiraVez
-      ? 'Agora é só me mandar foto ou descrição das suas refeições! Use */hoje* pra ver seu progresso e */perfil* pra ver ou refazer suas metas.'
+      ? 'Agora é só me mandar foto ou descrição das suas refeições! Use */hoje* pra ver seu progresso, */perfil* pra ver ou refazer suas metas, e */nome* pra trocar como eu te chamo.\n\n' +
+        '📸 *Dica pra eu acertar melhor:* quando mandar uma foto, se puder, escreve rapidinho o que tem no prato ' +
+        '(ex: "arroz, feijão, um bife pequeno e salada"). Isso ajuda bastante a precisão - e se eu errar algo, ' +
+        'só me corrigir (ex: "não tinha repolho" ou "não era 2 ovos, era 1") que eu ajusto na hora.'
       : 'Use */perfil refazer* se quiser preencher tudo de novo.')
   );
 }
@@ -408,6 +467,13 @@ function montarResumoPerfil(perfil, primeiraVez) {
 
 const SYSTEM_PROMPT_REFEICAO = `Você é o NutriZap, um assistente nutricional que analisa refeições descritas
 por foto ou texto e estima valores nutricionais.
+
+IMPORTANTE sobre precisão dos ingredientes: nunca invente um ingrediente específico que
+você não consegue ver claramente na foto ou que o usuário não mencionou. Se não tiver certeza
+sobre um item (ex: qual vegetal exato está numa salada, ou se tem algum tempero específico),
+descreva de forma mais genérica (ex: "salada de folhas verdes", "legumes variados") em vez de
+nomear um alimento específico que pode estar errado. É sempre melhor ser genérico e correto
+do que específico e errado - a pessoa pode corrigir depois se quiser mais precisão.
 
 Responda SEMPRE em formato JSON puro, sem markdown, sem texto antes ou depois, seguindo
 exatamente este formato:
@@ -939,6 +1005,23 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
+    // Trocar o nome que o bot usa pra chamar a pessoa (útil quando o nome do
+    // WhatsApp é uma frase/apelido, tipo "Jesus me ama", em vez do nome real)
+    if (comando.startsWith('/nome')) {
+      const novoNome = textoRecebido.trim().slice(5).trim(); // tira o "/nome" preservando maiúsculas
+      if (!novoNome) {
+        await enviarTexto(
+          numero,
+          `Seu nome atual é: *${perfil.nome || 'não configurado'}*.\n\nPra trocar, manda */nome SeuNome* (ex: */nome Mateus*)`
+        );
+      } else {
+        perfil.nome = novoNome.split(' ')[0]; // guarda só o primeiro nome, como já fazemos com o pushName
+        await enviarTexto(numero, `✅ Prontinho! Agora vou te chamar de *${perfil.nome}*.`);
+      }
+      await salvarUsuario(numero, usuario);
+      return;
+    }
+
     if (comando === '/ajuda') {
       await enviarTexto(
         numero,
@@ -946,7 +1029,8 @@ app.post('/webhook', async (req, res) => {
           '📸 Manda foto/texto de uma refeição pra registrar\n' +
           '*/hoje* - resumo do dia\n' +
           '*/perfil* - ver suas metas\n' +
-          '*/perfil refazer* - refazer a entrevista inicial'
+          '*/perfil refazer* - refazer a entrevista inicial\n' +
+          '*/nome SeuNome* - trocar como eu te chamo'
       );
       await salvarUsuario(numero, usuario);
       return;
