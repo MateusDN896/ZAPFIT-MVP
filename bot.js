@@ -1,5 +1,5 @@
 /**
- * ZapFit v2 - usando Evolution API + Perfil de usuário
+ * NutriZap v2 - usando Evolution API + Perfil de usuário
  * ------------------------------------------------------
  * Esse bot:
  * 1. Sobe um servidor web (Express) que fica esperando a Evolution API
@@ -93,6 +93,26 @@ function pareceConversaComum(texto) {
   return false;
 }
 
+// Usuário corrigindo a última refeição registrada (ex: "não era 2 ovos, era 1")
+const REGEX_CORRECAO =
+  /\b(na verdade|me enganei|errei|foi engano|não era|nao era|não foi|nao foi|corrige|corrigir|esquece,? era|desconsidera,? era)\b/i;
+
+// Usuário perguntando quanto pode/deve comer (quer saber a porção ideal)
+const REGEX_PERGUNTA_PORCAO =
+  /(quantidade ideal|quanto (posso|devo|deveria|d[áa] pra)|qual a por[cç][ãa]o|posso comer quanto)/i;
+
+// Usuário falando que PRETENDE comer algo, ainda não comeu
+const REGEX_INTENCAO_FUTURA =
+  /\b(vou comer|vou almo[çc]ar|vou jantar|vou lanchar|pretendo comer|quero comer|penso em comer|acho que vou comer|vou beliscar)\b/i;
+
+// Usuário confirmando que já comeu uma refeição que tinha ficado "pendente"
+const REGEX_CONFIRMACAO_REFEICAO =
+  /^(sim|comi|j[áa] comi|confirmo|isso mesmo|comi sim|confere|correto|exato)\b/i;
+
+// Sinal de que a pessoa JÁ comeu (usado só pra detectar ambiguidade quando
+// aparece junto com um sinal de intenção futura na mesma mensagem)
+const REGEX_JA_COMI = /\b(comi|j[áa] comi|acabei de comer|comendo agora|estou comendo)\b/i;
+
 // ---------- Cálculo de meta calórica (fórmula de Mifflin-St Jeor) ----------
 
 const FATOR_ATIVIDADE = {
@@ -159,7 +179,7 @@ function calcularMetas(perfil) {
 // ---------- Onboarding (entrevista inicial) ----------
 
 function textoBoasVindas(nome) {
-  const saudacao = nome ? `👋 Oi, ${nome}! Eu sou o *ZapFit*` : '👋 Oi! Eu sou o *ZapFit*';
+  const saudacao = nome ? `👋 Oi, ${nome}! Eu sou o *NutriZap*` : '👋 Oi! Eu sou o *NutriZap*';
   return (
     `${saudacao}, seu assistente de calorias no WhatsApp.\n\n` +
     'Antes de começar, vou te fazer algumas perguntas rápidas pra calcular sua meta ' +
@@ -324,7 +344,7 @@ function montarResumoPerfil(perfil, primeiraVez) {
 
 // ---------- Prompts para o Claude ----------
 
-const SYSTEM_PROMPT_REFEICAO = `Você é o ZapFit, um assistente nutricional que analisa refeições descritas
+const SYSTEM_PROMPT_REFEICAO = `Você é o NutriZap, um assistente nutricional que analisa refeições descritas
 por foto ou texto e estima valores nutricionais.
 
 Responda SEMPRE em formato JSON puro, sem markdown, sem texto antes ou depois, seguindo
@@ -361,7 +381,7 @@ Responda SEMPRE em formato JSON puro, sem markdown, sem texto antes ou depois:
 Se não conseguir ler a imagem ou não achar números de calorias/macros, responda
 "conseguiu_ler": false e explique o motivo em "observacao".`;
 
-const SYSTEM_PROMPT_CHAT = `Você é o ZapFit, um assistente de nutrição e hábitos alimentares que
+const SYSTEM_PROMPT_CHAT = `Você é o NutriZap, um assistente de nutrição e hábitos alimentares que
 conversa por WhatsApp. O usuário mandou uma mensagem que NÃO é uma refeição pra registrar
 (é uma saudação, pergunta ou comentário casual).
 
@@ -406,6 +426,109 @@ async function responderConversa({ numero, perfil, usuario, textoUsuario }) {
     resposta || `${perfil.nome ? `Oi, ${perfil.nome}! ` : 'Oi! '}Como posso te ajudar com sua alimentação hoje? 🍽️`
   );
 }
+
+// Usuário perguntou "quanto posso comer de X" - calcula o orçamento calórico
+// que ainda resta no dia e sugere uma porção, sem registrar nada ainda.
+async function sugerirPorcao({ numero, perfil, usuario, textoUsuario }) {
+  const { totais } = calcularTotaisHoje(usuario);
+
+  // Estimativa grosseira de quantas refeições ainda faltam hoje, baseada no
+  // horário atual - só pra dar um contexto melhor pro Claude, não é exato.
+  const hora = new Date().getHours();
+  let refeicoesRestantes = 3;
+  if (hora >= 20) refeicoesRestantes = 1;
+  else if (hora >= 15) refeicoesRestantes = 2;
+  else if (hora >= 10) refeicoesRestantes = 3;
+  else refeicoesRestantes = 4;
+
+  let contextoMeta;
+  if (perfil?.completo && perfil.meta_calorias && perfil.objetivo !== '4') {
+    const restante = Math.max(perfil.meta_calorias - totais.calorias, 0);
+    const orcamentoPorRefeicao = Math.round(restante / refeicoesRestantes);
+    contextoMeta =
+      `Meta diária do usuário: ${perfil.meta_calorias} kcal. Já consumiu hoje: ${totais.calorias} kcal. ` +
+      `Restam aproximadamente ${restante} kcal pro resto do dia, considerando cerca de ${refeicoesRestantes} ` +
+      `refeições restantes (~${orcamentoPorRefeicao} kcal por refeição, só como referência).`;
+  } else {
+    contextoMeta = 'O usuário não tem meta calórica configurada.';
+  }
+
+  const prompt =
+    `${contextoMeta}\n\nO usuário perguntou: "${textoUsuario}"\n\n` +
+    'Sugira uma porção/quantidade razoável desse alimento que caiba no orçamento calórico ' +
+    'restante dele, em linguagem natural pra WhatsApp (2-4 frases, sem JSON, emoji com moderação). ' +
+    'Se for útil, pergunta se ele pretende comer mais alguma coisa hoje pra afinar a sugestão.';
+
+  const resposta = await chamarClaudeTexto({ systemPrompt: SYSTEM_PROMPT_CHAT, texto: prompt });
+
+  await enviarTexto(
+    numero,
+    resposta || 'Não consegui calcular isso agora. Pode descrever de novo o que você quer comer?'
+  );
+}
+
+// Usuário corrigindo a última refeição registrada (ex: "não era 2 ovos, era 1").
+// Substitui o último registro em vez de somar em cima dele.
+async function corrigirUltimaRefeicao({ numero, usuario, textoCorrecao }) {
+  const ultima = usuario.refeicoes[usuario.refeicoes.length - 1];
+
+  if (!ultima) {
+    await enviarTexto(
+      numero,
+      'Não achei nenhuma refeição recente pra corrigir. Pode descrever a refeição certinha de novo?'
+    );
+    return;
+  }
+
+  const contexto =
+    `A última refeição registrada foi interpretada assim: ${JSON.stringify(ultima.analise.alimentos)}, ` +
+    `totalizando ${ultima.analise.calorias_kcal} kcal. O usuário está corrigindo essa informação: "${textoCorrecao}". ` +
+    'Refaça a análise levando em conta a correção (ex: se ele disse que era 1 ovo em vez de 2, ' +
+    'recalcule considerando só 1 ovo, não os dois).';
+
+  const analiseCorrigida = await chamarClaude({ systemPrompt: SYSTEM_PROMPT_REFEICAO, texto: contexto });
+
+  if (analiseCorrigida) {
+    usuario.refeicoes[usuario.refeicoes.length - 1] = { data: ultima.data, analise: analiseCorrigida };
+    await enviarTexto(numero, `✅ Corrigido!\n\n${formatarResposta(analiseCorrigida)}`);
+  } else {
+    await enviarTexto(numero, '⚠️ Não consegui refazer o cálculo. Pode descrever a refeição certinha, do zero?');
+  }
+}
+
+// Mensagem ambígua (tem sinal de "já comi" E "vou comer" ao mesmo tempo) -
+// em vez de adivinhar, pergunta pro usuário qual é o caso.
+async function perguntarSeJaComeu({ numero, usuario, textoOriginal }) {
+  usuario.aguardandoTipoRefeicao = { textoOriginal };
+  await enviarTexto(
+    numero,
+    '🤔 Só pra eu registrar certinho: você já comeu isso, ou ainda vai comer?'
+  );
+}
+
+
+// mas NÃO registra como refeição ainda. Fica "pendente" até ele confirmar.
+async function estimarRefeicaoFutura({ numero, usuario, textoUsuario }) {
+  const analise = await chamarClaude({
+    systemPrompt: SYSTEM_PROMPT_REFEICAO,
+    texto: `O usuário disse que PRETENDE comer isso (ainda não comeu): "${textoUsuario}". Estime os valores normalmente.`,
+  });
+
+  if (!analise) {
+    await enviarTexto(numero, '⚠️ Não consegui estimar isso. Pode descrever de outro jeito?');
+    return;
+  }
+
+  usuario.refeicaoPendente = { analise, criadoEm: new Date().toISOString() };
+
+  await enviarTexto(
+    numero,
+    `${formatarResposta(analise)}\n\n` +
+      '_Isso é só uma estimativa de quando você comer._ Quando comer de verdade, me avisa ' +
+      '(ex: "comi" ou "confirmo") que eu registro certinho! 😉'
+  );
+}
+
 
 async function chamarClaude({ systemPrompt, texto, imagemBase64, mimeType }) {
   const content = [];
@@ -457,14 +580,9 @@ function formatarResposta(analise) {
   );
 }
 
-function resumoDoDia(usuario) {
+function calcularTotaisHoje(usuario) {
   const hoje = new Date().toISOString().slice(0, 10);
   const registrosHoje = (usuario.refeicoes || []).filter((r) => r.data.startsWith(hoje));
-  const perfil = usuario.perfil;
-
-  if (registrosHoje.length === 0) {
-    return 'Você ainda não registrou nenhuma refeição hoje. Manda uma foto ou descreve o que comeu! 📸';
-  }
 
   const totais = registrosHoje.reduce(
     (acc, r) => ({
@@ -475,6 +593,17 @@ function resumoDoDia(usuario) {
     }),
     { calorias: 0, proteina: 0, carboidrato: 0, gordura: 0 }
   );
+
+  return { registrosHoje, totais };
+}
+
+function resumoDoDia(usuario) {
+  const { registrosHoje, totais } = calcularTotaisHoje(usuario);
+  const perfil = usuario.perfil;
+
+  if (registrosHoje.length === 0) {
+    return 'Você ainda não registrou nenhuma refeição hoje. Manda uma foto ou descreve o que comeu! 📸';
+  }
 
   let texto =
     `📊 *Resumo de hoje* (${registrosHoje.length} refeições)\n\n` +
@@ -639,6 +768,75 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
+    // --- Perfil já completo: fluxos especiais primeiro ---
+
+    // Resposta a uma pergunta de "você já comeu ou ainda vai comer?" que
+    // ficou pendente de uma mensagem ambígua anterior.
+    if (usuario.aguardandoTipoRefeicao) {
+      const textoOriginal = usuario.aguardandoTipoRefeicao.textoOriginal;
+      const disseQueJaComeu = !/^(n[ãa]o|ainda n[ãa]o|vou comer|depois|mais tarde|ainda vou)/i.test(comando);
+      usuario.aguardandoTipoRefeicao = null;
+
+      if (disseQueJaComeu) {
+        const analise = await chamarClaude({
+          systemPrompt: SYSTEM_PROMPT_REFEICAO,
+          texto: `O usuário confirmou que já comeu isso: "${textoOriginal}". Analise e retorne o JSON.`,
+        });
+        if (analise) usuario.refeicoes.push({ data: new Date().toISOString(), analise });
+        await enviarTexto(numero, formatarResposta(analise));
+      } else {
+        await estimarRefeicaoFutura({ numero, usuario, textoUsuario: textoOriginal });
+      }
+      salvarDados(dadosGlobais);
+      return;
+    }
+
+    // Confirmação de uma refeição que tinha ficado "pendente" (ex: usuário
+    // disse "vou comer X" antes, e agora confirma que comeu de verdade)
+    if (usuario.refeicaoPendente && REGEX_CONFIRMACAO_REFEICAO.test(comando)) {
+      usuario.refeicoes.push({ data: new Date().toISOString(), analise: usuario.refeicaoPendente.analise });
+      await enviarTexto(numero, `✅ Registrado!\n\n${formatarResposta(usuario.refeicaoPendente.analise)}`);
+      usuario.refeicaoPendente = null;
+      salvarDados(dadosGlobais);
+      return;
+    }
+
+    // Correção da última refeição registrada (ex: "não era 2 ovos, era 1")
+    if (!mensagem.imageMessage && REGEX_CORRECAO.test(textoRecebido) && usuario.refeicoes.length > 0) {
+      await corrigirUltimaRefeicao({ numero, usuario, textoCorrecao: textoRecebido });
+      salvarDados(dadosGlobais);
+      return;
+    }
+
+    // Pergunta sobre porção/quantidade ideal (checa ANTES do filtro de "papo
+    // comum" genérico, já que essas perguntas também têm "?")
+    if (!mensagem.imageMessage && REGEX_PERGUNTA_PORCAO.test(textoRecebido)) {
+      await sugerirPorcao({ numero, perfil, usuario, textoUsuario: textoRecebido });
+      salvarDados(dadosGlobais);
+      return;
+    }
+
+    // Mensagem ambígua: tem sinal de "já comi" E "vou comer" ao mesmo tempo
+    // (ex: "já comi o almoço, mas ainda vou comer sobremesa depois").
+    // Em vez de adivinhar qual das duas coisas vale, pergunta pro usuário.
+    if (
+      !mensagem.imageMessage &&
+      REGEX_INTENCAO_FUTURA.test(textoRecebido) &&
+      REGEX_JA_COMI.test(textoRecebido)
+    ) {
+      await perguntarSeJaComeu({ numero, usuario, textoOriginal: textoRecebido });
+      salvarDados(dadosGlobais);
+      return;
+    }
+
+    // Usuário falando que PRETENDE comer algo - não registra ainda, só estima
+    // e espera confirmação (evita contar calorias de comida que nem foi comida)
+    if (!mensagem.imageMessage && REGEX_INTENCAO_FUTURA.test(textoRecebido)) {
+      await estimarRefeicaoFutura({ numero, usuario, textoUsuario: textoRecebido });
+      salvarDados(dadosGlobais);
+      return;
+    }
+
     // --- Perfil já completo: papo comum (sem foto) não vira "refeição" ---
     if (!mensagem.imageMessage && !mensagem.audioMessage && pareceConversaComum(textoRecebido)) {
       await responderConversa({ numero, perfil, usuario, textoUsuario: textoRecebido });
@@ -705,12 +903,12 @@ app.post('/webhook', async (req, res) => {
 
 // Rota simples só pra confirmar que o servidor tá de pé
 app.get('/', (req, res) => {
-  res.send('ZapFit bot rodando! ✅');
+  res.send('NutriZap bot rodando! ✅');
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\n✅ ZapFit (Evolution API) rodando na porta ${PORT}\n`);
+  console.log(`\n✅ NutriZap (Evolution API) rodando na porta ${PORT}\n`);
   console.log(`Configure o webhook da sua instância na Evolution API para apontar para:`);
   console.log(`https://SEU-DOMINIO-DO-RAILWAY/webhook\n`);
 });
