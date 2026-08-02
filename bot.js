@@ -8,20 +8,22 @@
  *    pra saber objetivo, peso, altura, idade, sexo e nível de atividade -
  *    e calcula uma meta diária de calorias e macros.
  * 3. Se o usuário já tiver uma dieta pronta, ele pode mandar foto/print dela
- *    e o Claude extrai as metas de lá em vez de calcular do zero.
+ *    e a IA extrai as metas de lá em vez de calcular do zero.
  * 4. Depois disso, cada refeição mandada é comparada contra a meta do dia.
+ *
+ * IA: usa a API da OpenAI (GPT-5.6).
  */
 
 require('dotenv').config();
 const express = require('express');
-const Anthropic = require('@anthropic-ai/sdk');
+const OpenAI = require('openai');
 const fs = require('fs');
 const path = require('path');
 
 // ---------- Configuração ----------
 
 const REQUIRED_ENV = [
-  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
   'EVOLUTION_API_URL',
   'EVOLUTION_API_KEY',
   'EVOLUTION_INSTANCE',
@@ -34,7 +36,19 @@ for (const key of REQUIRED_ENV) {
   }
 }
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Modelo mais caro/capaz - usado só pra tarefas que exigem precisão
+// (analisar foto de comida, ler foto de dieta, corrigir cálculo).
+const MODELO_ANALISE = 'gpt-5.6-terra';
+
+// Modelo mais barato - usado pra conversa comum (saudação, pergunta de
+// porção, papo casual) onde não precisamos do modelo mais caro.
+const MODELO_CONVERSA = 'gpt-5.6-luna';
+
+// OBS: diferente da Anthropic, a OpenAI faz cache de prompt automaticamente
+// pra prompts repetidos - não precisa marcar nada no código pra ganhar esse
+// desconto, então não existe mais uma função "systemComCache" aqui.
 
 // .trim() remove espaços/quebras de linha escondidas que às vezes entram
 // quando a variável é colada no Railway - isso evita erros estranhos de
@@ -101,9 +115,10 @@ const REGEX_CORRECAO =
 const REGEX_PERGUNTA_PORCAO =
   /(quantidade ideal|quanto (posso|devo|deveria|d[áa] pra)|qual a por[cç][ãa]o|posso comer quanto)/i;
 
-// Usuário falando que PRETENDE comer algo, ainda não comeu
+// Usuário falando que PRETENDE comer algo (ainda não comeu), OU perguntando
+// de forma hipotética/condicional ("se eu comer X", "e se eu comesse X")
 const REGEX_INTENCAO_FUTURA =
-  /\b(vou comer|vou almo[çc]ar|vou jantar|vou lanchar|pretendo comer|quero comer|penso em comer|acho que vou comer|vou beliscar)\b/i;
+  /\b(vou comer|vou almo[çc]ar|vou jantar|vou lanchar|pretendo comer|quero comer|penso em comer|acho que vou comer|vou beliscar|se eu comer|se eu comesse|se comer|se comesse|caso eu coma|caso coma|posso comer|será que posso comer)\b/i;
 
 // Usuário confirmando que já comeu uma refeição que tinha ficado "pendente"
 const REGEX_CONFIRMACAO_REFEICAO =
@@ -342,7 +357,7 @@ function montarResumoPerfil(perfil, primeiraVez) {
   );
 }
 
-// ---------- Prompts para o Claude ----------
+// ---------- Prompts para a IA ----------
 
 const SYSTEM_PROMPT_REFEICAO = `Você é o NutriZap, um assistente nutricional que analisa refeições descritas
 por foto ou texto e estima valores nutricionais.
@@ -401,15 +416,17 @@ function limparJson(texto) {
   return texto.replace(/```json/gi, '').replace(/```/g, '').trim();
 }
 
-async function chamarClaudeTexto({ systemPrompt, texto }) {
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 300,
-    system: systemPrompt,
-    messages: [{ role: 'user', content: texto }],
+async function chamarIATexto({ systemPrompt, texto }) {
+  const response = await openai.chat.completions.create({
+    model: MODELO_CONVERSA,
+    max_completion_tokens: 300,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: texto },
+    ],
   });
 
-  return response.content.find((b) => b.type === 'text')?.text?.trim() || null;
+  return response.choices[0]?.message?.content?.trim() || null;
 }
 
 async function responderConversa({ numero, perfil, usuario, textoUsuario }) {
@@ -419,7 +436,7 @@ async function responderConversa({ numero, perfil, usuario, textoUsuario }) {
     `Resumo de hoje: ${resumoDoDia(usuario)}\n\n` +
     `Mensagem do usuário: "${textoUsuario}"`;
 
-  const resposta = await chamarClaudeTexto({ systemPrompt: SYSTEM_PROMPT_CHAT, texto: contexto });
+  const resposta = await chamarIATexto({ systemPrompt: SYSTEM_PROMPT_CHAT, texto: contexto });
 
   await enviarTexto(
     numero,
@@ -433,7 +450,7 @@ async function sugerirPorcao({ numero, perfil, usuario, textoUsuario }) {
   const { totais } = calcularTotaisHoje(usuario);
 
   // Estimativa grosseira de quantas refeições ainda faltam hoje, baseada no
-  // horário atual - só pra dar um contexto melhor pro Claude, não é exato.
+  // horário atual - só pra dar um contexto melhor pra IA, não é exato.
   const hora = new Date().getHours();
   let refeicoesRestantes = 3;
   if (hora >= 20) refeicoesRestantes = 1;
@@ -459,7 +476,7 @@ async function sugerirPorcao({ numero, perfil, usuario, textoUsuario }) {
     'restante dele, em linguagem natural pra WhatsApp (2-4 frases, sem JSON, emoji com moderação). ' +
     'Se for útil, pergunta se ele pretende comer mais alguma coisa hoje pra afinar a sugestão.';
 
-  const resposta = await chamarClaudeTexto({ systemPrompt: SYSTEM_PROMPT_CHAT, texto: prompt });
+  const resposta = await chamarIATexto({ systemPrompt: SYSTEM_PROMPT_CHAT, texto: prompt });
 
   await enviarTexto(
     numero,
@@ -486,7 +503,7 @@ async function corrigirUltimaRefeicao({ numero, usuario, textoCorrecao }) {
     'Refaça a análise levando em conta a correção (ex: se ele disse que era 1 ovo em vez de 2, ' +
     'recalcule considerando só 1 ovo, não os dois).';
 
-  const analiseCorrigida = await chamarClaude({ systemPrompt: SYSTEM_PROMPT_REFEICAO, texto: contexto });
+  const analiseCorrigida = await chamarIA({ systemPrompt: SYSTEM_PROMPT_REFEICAO, texto: contexto });
 
   if (analiseCorrigida) {
     usuario.refeicoes[usuario.refeicoes.length - 1] = { data: ultima.data, analise: analiseCorrigida };
@@ -509,7 +526,7 @@ async function perguntarSeJaComeu({ numero, usuario, textoOriginal }) {
 
 // mas NÃO registra como refeição ainda. Fica "pendente" até ele confirmar.
 async function estimarRefeicaoFutura({ numero, usuario, textoUsuario }) {
-  const analise = await chamarClaude({
+  const analise = await chamarIA({
     systemPrompt: SYSTEM_PROMPT_REFEICAO,
     texto: `O usuário disse que PRETENDE comer isso (ainda não comeu): "${textoUsuario}". Estime os valores normalmente.`,
   });
@@ -530,34 +547,37 @@ async function estimarRefeicaoFutura({ numero, usuario, textoUsuario }) {
 }
 
 
-async function chamarClaude({ systemPrompt, texto, imagemBase64, mimeType }) {
+async function chamarIA({ systemPrompt, texto, imagemBase64, mimeType }) {
   const content = [];
-
-  if (imagemBase64) {
-    content.push({
-      type: 'image',
-      source: { type: 'base64', media_type: mimeType || 'image/jpeg', data: imagemBase64 },
-    });
-  }
 
   content.push({
     type: 'text',
     text: texto || 'Analise a imagem e retorne o JSON.',
   });
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 600,
-    system: systemPrompt,
-    messages: [{ role: 'user', content }],
+  if (imagemBase64) {
+    content.push({
+      type: 'image_url',
+      image_url: { url: `data:${mimeType || 'image/jpeg'};base64,${imagemBase64}` },
+    });
+  }
+
+  const response = await openai.chat.completions.create({
+    model: MODELO_ANALISE,
+    max_completion_tokens: 600,
+    response_format: { type: 'json_object' }, // força a OpenAI a devolver JSON válido
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content },
+    ],
   });
 
-  const textoResposta = response.content.find((b) => b.type === 'text')?.text || '{}';
+  const textoResposta = response.choices[0]?.message?.content || '{}';
 
   try {
     return JSON.parse(limparJson(textoResposta));
   } catch (e) {
-    console.error('Não consegui interpretar a resposta do Claude:', textoResposta);
+    console.error('Não consegui interpretar a resposta da IA:', textoResposta);
     return null;
   }
 }
@@ -624,6 +644,32 @@ function resumoDoDia(usuario) {
   }
 
   return texto;
+}
+
+// Aviso gentil e sincero quando o uso do dia fica bem alto - é genuinamente
+// pensado pro bem-estar do usuário (registrar comida de forma obsessiva não
+// é saudável), aparece no máximo 1x por dia, e nunca esconde nada: só
+// descreve exatamente o que está acontecendo (muitos registros hoje).
+function jaAvisouUsoExcessivoHoje(usuario) {
+  const hoje = new Date().toISOString().slice(0, 10);
+  return usuario.avisoUsoExcessivoEm === hoje;
+}
+
+async function talvezAvisarUsoExcessivo(numero, usuario) {
+  const LIMITE_DIARIO_PARA_AVISO = 8;
+  const { registrosHoje } = calcularTotaisHoje(usuario);
+
+  if (registrosHoje.length < LIMITE_DIARIO_PARA_AVISO) return;
+  if (jaAvisouUsoExcessivoHoje(usuario)) return;
+
+  usuario.avisoUsoExcessivoEm = new Date().toISOString().slice(0, 10);
+
+  await enviarTexto(
+    numero,
+    '🌿 Reparei que você já registrou bastante coisa hoje! Se já bateu (ou passou) sua meta, ' +
+      'fica tranquilo(a) — não precisa registrar tudo tão certinho pelo resto do dia. ' +
+      'Registrar demais também pode virar mais uma fonte de estresse, e não é essa a ideia aqui. 💛'
+  );
 }
 
 // ---------- Funções que chamam a Evolution API ----------
@@ -737,7 +783,7 @@ app.post('/webhook', async (req, res) => {
           mimeType = mensagem.imageMessage.mimetype || 'image/jpeg';
         }
 
-        const extraido = await chamarClaude({
+        const extraido = await chamarIA({
           systemPrompt: SYSTEM_PROMPT_DIETA,
           texto: 'Leia essa dieta e extraia a meta diária de calorias e macros.',
           imagemBase64,
@@ -778,12 +824,13 @@ app.post('/webhook', async (req, res) => {
       usuario.aguardandoTipoRefeicao = null;
 
       if (disseQueJaComeu) {
-        const analise = await chamarClaude({
+        const analise = await chamarIA({
           systemPrompt: SYSTEM_PROMPT_REFEICAO,
           texto: `O usuário confirmou que já comeu isso: "${textoOriginal}". Analise e retorne o JSON.`,
         });
         if (analise) usuario.refeicoes.push({ data: new Date().toISOString(), analise });
         await enviarTexto(numero, formatarResposta(analise));
+        await talvezAvisarUsoExcessivo(numero, usuario);
       } else {
         await estimarRefeicaoFutura({ numero, usuario, textoUsuario: textoOriginal });
       }
@@ -797,6 +844,7 @@ app.post('/webhook', async (req, res) => {
       usuario.refeicoes.push({ data: new Date().toISOString(), analise: usuario.refeicaoPendente.analise });
       await enviarTexto(numero, `✅ Registrado!\n\n${formatarResposta(usuario.refeicaoPendente.analise)}`);
       usuario.refeicaoPendente = null;
+      await talvezAvisarUsoExcessivo(numero, usuario);
       salvarDados(dadosGlobais);
       return;
     }
@@ -869,7 +917,7 @@ app.post('/webhook', async (req, res) => {
       return; // nada pra analisar
     }
 
-    const analise = await chamarClaude({
+    const analise = await chamarIA({
       systemPrompt: SYSTEM_PROMPT_REFEICAO,
       texto: textoRecebido
         ? `O usuário descreveu a refeição assim: "${textoRecebido}". Analise e retorne o JSON.`
@@ -894,8 +942,9 @@ app.post('/webhook', async (req, res) => {
       usuario.refeicoes.push({ data: new Date().toISOString(), analise });
     }
 
-    salvarDados(dadosGlobais);
     await enviarTexto(numero, formatarResposta(analise));
+    if (analise) await talvezAvisarUsoExcessivo(numero, usuario);
+    salvarDados(dadosGlobais);
   } catch (erro) {
     console.error('Erro processando webhook:', erro);
   }
