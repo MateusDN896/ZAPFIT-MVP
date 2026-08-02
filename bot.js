@@ -113,15 +113,17 @@ function pareceConversaComum(texto) {
 const REGEX_CORRECAO =
   /\b(na verdade|me enganei|errei|foi engano|não era|nao era|não foi|nao foi|corrige|corrigir|esquece,? era|desconsidera,? era)\b/i;
 
-// Usuário perguntando quanto pode/deve comer (quer saber a porção ideal)
+// Usuário perguntando se/quanto pode comer algo específico - tanto no
+// formato "quanto posso comer" quanto "posso comer X?" (permissão)
 const REGEX_PERGUNTA_PORCAO =
-  /(quantidade ideal|quanto (posso|devo|deveria|d[áa] pra)|qual a por[cç][ãa]o|posso comer quanto)/i;
+  /(quantidade ideal|quant[ao]s?\s+(eu\s+)?(posso|devo|deveria|d[áa] pra)|qual a por[cç][ãa]o|posso comer|ainda posso comer|d[áa] pra comer|ser[áa] que posso comer|posso tomar|ainda posso tomar|d[áa] pra tomar|ser[áa] que posso tomar)/i;
 
 // Usuário falando que PRETENDE comer/tomar algo (ainda não consumiu), OU
 // perguntando de forma hipotética/condicional ("se eu comer X", "se eu tomar
-// X"). Cobre tanto comida ("comer") quanto bebida ("tomar").
+// X"). Cobre tanto comida ("comer") quanto bebida ("tomar"). Perguntas de
+// permissão ("posso comer X?") já são tratadas pela REGEX_PERGUNTA_PORCAO.
 const REGEX_INTENCAO_FUTURA =
-  /\b(vou (comer|tomar|almo[çc]ar|jantar|lanchar|beliscar)|pretendo (comer|tomar)|quero (comer|tomar)|penso em (comer|tomar)|acho que vou (comer|tomar)|se eu (comer|comesse|tomar|tomasse)|se (comer|comesse|tomar|tomasse)|caso eu (coma|tome)|caso (coma|tome)|posso (comer|tomar)|será que posso (comer|tomar))\b/i;
+  /\b(vou (comer|tomar|almo[çc]ar|jantar|lanchar|beliscar)|pretendo (comer|tomar)|quero (comer|tomar)|penso em (comer|tomar)|acho que vou (comer|tomar)|se eu (comer|comesse|tomar|tomasse)|se (comer|comesse|tomar|tomasse)|caso eu (coma|tome)|caso (coma|tome))\b/i;
 
 // Usuário confirmando que já comeu uma refeição que tinha ficado "pendente"
 const REGEX_CONFIRMACAO_REFEICAO =
@@ -444,6 +446,24 @@ alimentação/hábitos.
 
 Não responda em JSON - só texto puro, pronto pra ser mandado direto no WhatsApp.`;
 
+const SYSTEM_PROMPT_PORCAO = `Você é o NutriZap, respondendo se a pessoa PODE comer/tomar algo
+específico agora, considerando quanto ela já consumiu hoje e sua meta.
+
+Seja realista e direto, baseado exatamente nos números fornecidos:
+- Se o alimento cabe folgado no que resta da meta, diga isso com tranquilidade, sem enrolar.
+- Se vai deixar a pessoa no limite ou passar um pouco, avise isso claramente, sem dramatizar
+  (ex: "vai passar uns 80 kcal da meta, mas não é nada grave").
+- Se a pessoa JÁ passou da meta hoje, seja honesto sobre isso também, sem julgar e sem fingir
+  que ainda sobra espaço.
+- Quando fizer sentido, sugira uma porção parcial (ex: "metade dela", "um terço", "só um
+  pedaço") em vez de simplesmente dizer sim ou não.
+- Nunca invente número - use só os que foram te passados.
+
+Responda em 2-4 frases, tom de amigo/nutricionista mandando mensagem no WhatsApp, nada de
+formalidade. VARIE a estrutura da resposta entre uma pergunta e outra (às vezes comece pelo
+número, às vezes por uma opinião direta, às vezes devolvendo uma pergunta) - não repita
+sempre o mesmo formato de frase. Não responda em JSON, só texto puro.`;
+
 function limparJson(texto) {
   return texto.replace(/```json/gi, '').replace(/```/g, '').trim();
 }
@@ -492,23 +512,25 @@ async function sugerirPorcao({ numero, perfil, usuario, textoUsuario }) {
 
   let contextoMeta;
   if (perfil?.completo && perfil.meta_calorias && perfil.objetivo !== '4') {
-    const restante = Math.max(perfil.meta_calorias - totais.calorias, 0);
-    const orcamentoPorRefeicao = Math.round(restante / refeicoesRestantes);
+    // NÃO trava em zero de propósito - se a pessoa já passou da meta, a IA
+    // precisa saber disso pra ser honesta na resposta, em vez de fingir que
+    // ainda sobra espaço.
+    const restante = perfil.meta_calorias - totais.calorias;
+    const orcamentoPorRefeicao = Math.round(Math.max(restante, 0) / refeicoesRestantes);
     contextoMeta =
       `Meta diária do usuário: ${perfil.meta_calorias} kcal. Já consumiu hoje: ${totais.calorias} kcal. ` +
-      `Restam aproximadamente ${restante} kcal pro resto do dia, considerando cerca de ${refeicoesRestantes} ` +
-      `refeições restantes (~${orcamentoPorRefeicao} kcal por refeição, só como referência).`;
+      (restante >= 0
+        ? `Ainda restam ${restante} kcal pro resto do dia (considerando cerca de ${refeicoesRestantes} ` +
+          `refeições restantes, ~${orcamentoPorRefeicao} kcal por refeição, só como referência).`
+        : `ATENÇÃO: o usuário JÁ ULTRAPASSOU a meta em ${Math.abs(restante)} kcal hoje. Seja honesto sobre isso, ` +
+          `sem dramatizar - explica o impacto real de comer mais um pouco.`);
   } else {
     contextoMeta = 'O usuário não tem meta calórica configurada.';
   }
 
-  const prompt =
-    `${contextoMeta}\n\nO usuário perguntou: "${textoUsuario}"\n\n` +
-    'Sugira uma porção/quantidade razoável desse alimento que caiba no orçamento calórico ' +
-    'restante dele, em linguagem natural pra WhatsApp (2-4 frases, sem JSON, emoji com moderação). ' +
-    'Se for útil, pergunta se ele pretende comer mais alguma coisa hoje pra afinar a sugestão.';
+  const prompt = `${contextoMeta}\n\nO usuário perguntou: "${textoUsuario}"`;
 
-  const resposta = await chamarIATexto({ systemPrompt: SYSTEM_PROMPT_CHAT, texto: prompt });
+  const resposta = await chamarIATexto({ systemPrompt: SYSTEM_PROMPT_PORCAO, texto: prompt });
 
   await enviarTexto(
     numero,
@@ -612,12 +634,7 @@ async function estimarRefeicaoFutura({ numero, usuario, textoUsuario, imagemBase
 
   usuario.refeicaoPendente = { analise, criadoEm: new Date().toISOString() };
 
-  await enviarTexto(
-    numero,
-    `${formatarResposta(analise)}\n\n` +
-      '_Isso é só uma estimativa de quando você comer/tomar._ Quando for de verdade, me avisa ' +
-      '(ex: "comi" ou "confirmo") que eu registro certinho! 😉'
-  );
+  await enviarTexto(numero, formatarRespostaHipotetica(analise));
 }
 
 // Usuário contou que fez atividade física - estima o gasto calórico e
@@ -700,9 +717,25 @@ function formatarResposta(analise) {
     `🔥 Calorias: *${analise.calorias_kcal} kcal*\n` +
     `🥩 Proteína: ${analise.proteina_g}g\n` +
     `🍞 Carboidrato: ${analise.carboidrato_g}g\n` +
-    `🥑 Gordura: ${analise.gordura_g}g\n\n` +
-    (analise.observacao ? `_${analise.observacao}_\n\n` : '') +
-    `Confiança da estimativa: ${analise.confianca}`
+    `🥑 Gordura: ${analise.gordura_g}g` +
+    (analise.observacao ? `\n\n_${analise.observacao}_` : '')
+  );
+}
+
+// Formato DIFERENTE do "cartão de registro" acima - usado só pra estimativas
+// hipotéticas ("vou comer X", "se eu tomar X"), que ainda NÃO foram
+// registradas. Visual mais leve/informal, pra não parecer um recibo oficial.
+function formatarRespostaHipotetica(analise) {
+  if (!analise) {
+    return '⚠️ Não consegui estimar isso. Pode descrever de outro jeito?';
+  }
+
+  const nomes = analise.alimentos?.map((a) => a.nome).join(', ') || 'isso';
+
+  return (
+    `👀 Se você consumir *${nomes}*, a conta fica em torno de *${analise.calorias_kcal} kcal* ` +
+    `(🥩 ${analise.proteina_g}g · 🍞 ${analise.carboidrato_g}g · 🥑 ${analise.gordura_g}g).\n\n` +
+    `_Ainda não registrei nada — quando for de verdade, me avisa (ex: "comi" ou "confirmo")!_ 😉`
   );
 }
 
