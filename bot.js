@@ -38,9 +38,15 @@ for (const key of REQUIRED_ENV) {
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL.replace(/\/$/, ''); // remove barra no final, se tiver
-const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY;
-const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE;
+// .trim() remove espaços/quebras de linha escondidas que às vezes entram
+// quando a variável é colada no Railway - isso evita erros estranhos de
+// "Application not found".
+const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL.trim().replace(/\/+$/, ''); // remove barra(s) no final, se tiver
+const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY.trim();
+const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE.trim();
+
+console.log(`🔗 EVOLUTION_API_URL configurada como: "${EVOLUTION_API_URL}"`);
+console.log(`🔗 EVOLUTION_INSTANCE configurada como: "${EVOLUTION_INSTANCE}"`);
 
 const app = express();
 app.use(express.json({ limit: '20mb' })); // limite maior por causa das fotos em base64
@@ -101,7 +107,14 @@ async function analisarRefeicao({ texto, imagemBase64, mimeType }) {
     messages: [{ role: 'user', content }],
   });
 
-  const textoResposta = response.content.find((b) => b.type === 'text')?.text || '{}';
+  let textoResposta = response.content.find((b) => b.type === 'text')?.text || '{}';
+
+  // Às vezes o Claude devolve o JSON dentro de um bloco de código markdown
+  // (```json ... ```), então removemos isso antes de tentar interpretar.
+  textoResposta = textoResposta
+    .replace(/```json/gi, '')
+    .replace(/```/g, '')
+    .trim();
 
   try {
     return JSON.parse(textoResposta);
