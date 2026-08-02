@@ -1,13 +1,13 @@
 {
   "name": "zapfit-bot",
   "version": "2.0.0",
-  "description": "Bot de WhatsApp que analisa refeições e calcula calorias/macros usando Claude, via Evolution API",
+  "description": "Bot de WhatsApp que analisa refeições e calcula calorias/macros usando IA (OpenAI), via Evolution API",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.32.1",
+    "openai": "^4.77.0",
     "dotenv": "^16.4.5",
     "express": "^4.21.1"
   },
