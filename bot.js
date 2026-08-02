@@ -1,9 +1,9 @@
 /**
- * NutriZap v2 - usando Evolution API + Perfil de usuário
- * ------------------------------------------------------
+ * NutriZap v2 - usando a API oficial do WhatsApp (Meta Cloud API)
+ * -----------------------------------------------------------------
  * Esse bot:
- * 1. Sobe um servidor web (Express) que fica esperando a Evolution API
- *    avisar quando chega uma mensagem nova (webhook).
+ * 1. Sobe um servidor web (Express) que fica esperando a Meta avisar quando
+ *    chega uma mensagem nova (webhook), e responde direto pela Graph API.
  * 2. Na primeira conversa, faz uma "entrevista" (onboarding) com o usuário
  *    pra saber objetivo, peso, altura, idade, sexo e nível de atividade -
  *    e calcula uma meta diária de calorias e macros.
@@ -22,9 +22,9 @@ const OpenAI = require('openai');
 
 const REQUIRED_ENV = [
   'OPENAI_API_KEY',
-  'EVOLUTION_API_URL',
-  'EVOLUTION_API_KEY',
-  'EVOLUTION_INSTANCE',
+  'META_ACCESS_TOKEN',
+  'META_PHONE_NUMBER_ID',
+  'META_VERIFY_TOKEN',
   'DATABASE_URL',
 ];
 
@@ -49,15 +49,12 @@ const MODELO_CONVERSA = 'gpt-5.6-luna';
 // pra prompts repetidos - não precisa marcar nada no código pra ganhar esse
 // desconto, então não existe mais uma função "systemComCache" aqui.
 
-// .trim() remove espaços/quebras de linha escondidas que às vezes entram
-// quando a variável é colada no Railway - isso evita erros estranhos de
-// "Application not found".
-const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL.trim().replace(/\/+$/, '');
-const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY.trim();
-const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE.trim();
+const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN.trim();
+const META_PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID.trim();
+const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN.trim();
+const META_API_VERSION = 'v22.0';
 
-console.log(`🔗 EVOLUTION_API_URL configurada como: "${EVOLUTION_API_URL}"`);
-console.log(`🔗 EVOLUTION_INSTANCE configurada como: "${EVOLUTION_INSTANCE}"`);
+console.log(`🔗 META_PHONE_NUMBER_ID configurado como: "${META_PHONE_NUMBER_ID}"`);
 
 const app = express();
 app.use(express.json({ limit: '20mb' })); // limite maior por causa das fotos em base64
@@ -923,42 +920,116 @@ async function talvezAvisarUsoExcessivo(numero, usuario) {
   );
 }
 
-// ---------- Funções que chamam a Evolution API ----------
+// ---------- Funções que chamam a API oficial da Meta (Graph API) ----------
 
 async function enviarTexto(numero, texto) {
-  const url = `${EVOLUTION_API_URL}/message/sendText/${EVOLUTION_INSTANCE}`;
+  const url = `https://graph.facebook.com/${META_API_VERSION}/${META_PHONE_NUMBER_ID}/messages`;
   const resp = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      apikey: EVOLUTION_API_KEY,
+      Authorization: `Bearer ${META_ACCESS_TOKEN}`,
     },
-    body: JSON.stringify({ number: numero, text: texto }),
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      to: numero,
+      type: 'text',
+      text: { body: texto },
+    }),
   });
 
   if (!resp.ok) {
     const erro = await resp.text();
-    console.error('Erro ao enviar mensagem pela Evolution API:', resp.status, erro);
+    console.error('Erro ao enviar mensagem pela Meta Cloud API:', resp.status, erro);
   }
 }
 
-// ---------- Rota que recebe os eventos da Evolution API (webhook) ----------
+// Meta não manda a imagem já em base64 dentro do webhook (diferente da
+// Evolution API) - manda só um "media ID". Precisamos de 2 chamadas: uma pra
+// pegar a URL temporária de download, outra pra baixar o arquivo de verdade.
+async function baixarMidiaMeta(mediaId) {
+  try {
+    const infoResp = await fetch(`https://graph.facebook.com/${META_API_VERSION}/${mediaId}`, {
+      headers: { Authorization: `Bearer ${META_ACCESS_TOKEN}` },
+    });
+    const info = await infoResp.json();
+    if (!info.url) {
+      console.error('Não recebi URL de mídia da Meta:', JSON.stringify(info));
+      return null;
+    }
+
+    const arquivoResp = await fetch(info.url, {
+      headers: { Authorization: `Bearer ${META_ACCESS_TOKEN}` },
+    });
+    const buffer = Buffer.from(await arquivoResp.arrayBuffer());
+    return buffer.toString('base64');
+  } catch (erro) {
+    console.error('Erro ao baixar mídia da Meta:', erro.message);
+    return null;
+  }
+}
+
+// ---------- Rota que a Meta chama pra VERIFICAR o webhook (só acontece uma
+// vez, quando você configura a URL no painel do Facebook Developers) ----------
+
+app.get('/webhook', (req, res) => {
+  const modo = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const desafio = req.query['hub.challenge'];
+
+  if (modo === 'subscribe' && token === META_VERIFY_TOKEN) {
+    console.log('✅ Webhook verificado com sucesso pela Meta.');
+    res.status(200).send(desafio);
+  } else {
+    console.error('❌ Falha na verificação do webhook - token não bateu.');
+    res.sendStatus(403);
+  }
+});
+
+// ---------- Rota que recebe os eventos de mensagem da Meta (webhook) ----------
 
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // responde rápido pra Evolution API não ficar esperando
+  res.sendStatus(200); // responde rápido pra Meta não ficar esperando
 
   try {
     const body = req.body;
-    if (body.event !== 'messages.upsert') return;
 
-    const dados = body.data;
-    if (dados?.key?.fromMe) return; // ignora eco do próprio bot
+    // A Meta manda vários tipos de evento no mesmo webhook (mensagem nova,
+    // status de entrega, etc). Só nos interessa quando tem mensagem de
+    // verdade dentro de "changes[0].value.messages".
+    const valor = body?.entry?.[0]?.changes?.[0]?.value;
+    const msgMeta = valor?.messages?.[0];
+    if (!msgMeta) return; // provavelmente é só um status update ("lido", "entregue") - ignora
 
-    const remoteJid = dados?.key?.remoteJid || '';
-    if (remoteJid.endsWith('@g.us')) return; // ignora grupos
+    const numero = msgMeta.from; // número já vem só com dígitos, ex: "5522999999999"
 
-    const numero = remoteJid;
-    const mensagem = dados?.message || {};
+    // Baixa a imagem ANTES de montar o adaptador, se for o caso (a Meta só
+    // manda um "media ID" no webhook, não a imagem em si)
+    let imagemBase64Meta = null;
+    if (msgMeta.type === 'image') {
+      imagemBase64Meta = await baixarMidiaMeta(msgMeta.image.id);
+    }
+
+    // Monta um "mensagem" e um "dados" no MESMO formato que o resto do
+    // código já usava com a Evolution API, pra não precisar reescrever toda
+    // a lógica de negócio - só essa camada de tradução muda.
+    const mensagem = {};
+    if (msgMeta.type === 'text') {
+      mensagem.conversation = msgMeta.text.body;
+    } else if (msgMeta.type === 'image') {
+      mensagem.imageMessage = {
+        caption: msgMeta.image.caption || '',
+        mimetype: msgMeta.image.mime_type || 'image/jpeg',
+      };
+    } else if (msgMeta.type === 'audio') {
+      mensagem.audioMessage = {};
+    }
+
+    const dados = {
+      pushName: valor?.contacts?.[0]?.profile?.name || null,
+      message: { base64: imagemBase64Meta },
+      key: { fromMe: false, remoteJid: numero },
+    };
 
     const textoRecebido =
       mensagem.conversation ||
