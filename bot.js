@@ -1,32 +1,49 @@
 /**
- * ZapFit - Protótipo (MVP)
- * ------------------------
- * Bot de WhatsApp que recebe foto ou texto de uma refeição e devolve
- * uma estimativa de calorias e macros usando a API da Anthropic (Claude).
+ * ZapFit v2 - usando Evolution API
+ * ---------------------------------
+ * Esse bot NÃO usa mais whatsapp-web.js. Em vez disso, ele:
  *
- * Este é um protótipo GRATUITO usando whatsapp-web.js (conexão via QR Code,
- * igual ao WhatsApp Web). Serve para TESTAR a ideia antes de migrar para
- * a API oficial da Meta.
+ * 1. Sobe um servidor web (Express) que fica esperando a Evolution API
+ *    avisar quando chega uma mensagem nova (isso se chama "webhook").
+ * 2. Quando chega uma mensagem, ele manda pro Claude analisar.
+ * 3. Ele responde de volta pro usuário chamando a Evolution API.
  *
- * IMPORTANTE: use um número separado do seu WhatsApp pessoal para testar,
- * se possível, para reduzir risco de bloqueio.
+ * A conexão com o WhatsApp em si (QR Code, sessão, etc) já foi feita
+ * direto no painel da Evolution API (aquele /manager que você já usou).
+ * Esse bot só precisa SABER conversar com a Evolution API - não precisa
+ * mais gerar QR Code nenhum.
  */
 
 require('dotenv').config();
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const fs = require('fs');
 const path = require('path');
 
 // ---------- Configuração ----------
 
-if (!process.env.ANTHROPIC_API_KEY) {
-  console.error('\n❌ Faltando ANTHROPIC_API_KEY no arquivo .env. Veja o README.md.\n');
-  process.exit(1);
+const REQUIRED_ENV = [
+  'ANTHROPIC_API_KEY',
+  'EVOLUTION_API_URL',
+  'EVOLUTION_API_KEY',
+  'EVOLUTION_INSTANCE',
+];
+
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    console.error(`\n❌ Faltando ${key} no arquivo .env (ou nas variáveis do Railway). Veja o README.md.\n`);
+    process.exit(1);
+  }
 }
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL.replace(/\/$/, ''); // remove barra no final, se tiver
+const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY;
+const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE;
+
+const app = express();
+app.use(express.json({ limit: '20mb' })); // limite maior por causa das fotos em base64
 
 // Onde vamos guardar o histórico de cada usuário (arquivo simples em JSON,
 // só para o protótipo -- num produto de verdade isso vira um banco de dados)
@@ -60,15 +77,13 @@ exatamente este formato:
 Se não conseguir identificar comida na imagem/texto, responda com "confianca": "baixa"
 e uma observação explicando o motivo, mas ainda assim tente estimar.`;
 
-// ---------- Função que chama o Claude para analisar a refeição ----------
-
 async function analisarRefeicao({ texto, imagemBase64, mimeType }) {
   const content = [];
 
   if (imagemBase64) {
     content.push({
       type: 'image',
-      source: { type: 'base64', media_type: mimeType, data: imagemBase64 },
+      source: { type: 'base64', media_type: mimeType || 'image/jpeg', data: imagemBase64 },
     });
   }
 
@@ -80,7 +95,7 @@ async function analisarRefeicao({ texto, imagemBase64, mimeType }) {
   });
 
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6', // pode trocar para 'claude-haiku-4-5' para economizar
+    model: 'claude-sonnet-4-6',
     max_tokens: 500,
     system: SYSTEM_PROMPT,
     messages: [{ role: 'user', content }],
@@ -95,8 +110,6 @@ async function analisarRefeicao({ texto, imagemBase64, mimeType }) {
     return null;
   }
 }
-
-// ---------- Formatar a resposta que o usuário vai receber no WhatsApp ----------
 
 function formatarResposta(analise) {
   if (!analise) {
@@ -115,8 +128,6 @@ function formatarResposta(analise) {
     `Confiança da estimativa: ${analise.confianca}`
   );
 }
-
-// ---------- Comando /hoje: resumo do dia ----------
 
 function resumoDoDia(historicoUsuario) {
   const hoje = new Date().toISOString().slice(0, 10);
@@ -145,89 +156,133 @@ function resumoDoDia(historicoUsuario) {
   );
 }
 
-// ---------- Inicializar o cliente do WhatsApp ----------
+// ---------- Funções que chamam a Evolution API ----------
 
-const client = new Client({
-  authStrategy: new LocalAuth(), // salva a sessão localmente, não precisa escanear QR toda vez
-  puppeteer: {
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    // Em servidores (Railway/Render), usamos o Chromium já instalado no Dockerfile.
-    // No seu computador local, deixa em branco que ele baixa/usa o padrão.
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-  },
-});
+async function enviarTexto(numero, texto) {
+  const url = `${EVOLUTION_API_URL}/message/sendText/${EVOLUTION_INSTANCE}`;
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: EVOLUTION_API_KEY,
+    },
+    body: JSON.stringify({
+      number: numero,
+      text: texto,
+    }),
+  });
 
-client.on('qr', (qr) => {
-  console.log('\n📱 Escaneie este QR Code com o WhatsApp do número que vai virar o ZapFit:\n');
-  qrcode.generate(qr, { small: true });
-});
-
-client.on('ready', () => {
-  console.log('\n✅ ZapFit conectado e pronto para receber mensagens!\n');
-});
-
-client.on('message', async (message) => {
-  // Ignora mensagens de grupos no protótipo (foco em conversa 1:1 por enquanto)
-  const chat = await message.getChat();
-  if (chat.isGroup) return;
-
-  const historico = carregarHistorico();
-  const userId = message.from;
-  if (!historico[userId]) historico[userId] = [];
-
-  // Comando de resumo
-  if (message.body.trim().toLowerCase() === '/hoje') {
-    await message.reply(resumoDoDia(historico[userId]));
-    return;
+  if (!resp.ok) {
+    const erro = await resp.text();
+    console.error('Erro ao enviar mensagem pela Evolution API:', resp.status, erro);
   }
+}
 
-  if (message.body.trim().toLowerCase() === '/ajuda' || message.body.trim() === '') {
-    if (!message.hasMedia) {
-      await message.reply(
+// ---------- Rota que recebe os eventos da Evolution API (webhook) ----------
+
+app.post('/webhook', async (req, res) => {
+  // Responde rápido pra Evolution API não ficar esperando
+  res.sendStatus(200);
+
+  try {
+    const body = req.body;
+    const evento = body.event;
+
+    if (evento !== 'messages.upsert') return; // só nos importa mensagem nova
+
+    const dados = body.data;
+
+    // Ignora mensagens que o próprio bot mandou (eco)
+    if (dados?.key?.fromMe) return;
+
+    // Ignora mensagens de grupo (o remoteJid de grupo termina com @g.us)
+    const remoteJid = dados?.key?.remoteJid || '';
+    if (remoteJid.endsWith('@g.us')) return;
+
+    const numero = remoteJid; // já vem no formato certo pra responder, ex: 5511999999999@s.whatsapp.net
+    const mensagem = dados?.message || {};
+
+    const textoRecebido =
+      mensagem.conversation ||
+      mensagem.extendedTextMessage?.text ||
+      mensagem.imageMessage?.caption ||
+      '';
+
+    const historico = carregarHistorico();
+    if (!historico[numero]) historico[numero] = [];
+
+    // Comando /hoje
+    if (textoRecebido.trim().toLowerCase() === '/hoje') {
+      await enviarTexto(numero, resumoDoDia(historico[numero]));
+      return;
+    }
+
+    // Boas-vindas / ajuda
+    if (textoRecebido.trim().toLowerCase() === '/ajuda' && !mensagem.imageMessage) {
+      await enviarTexto(
+        numero,
         '👋 Oi! Eu sou o *ZapFit*.\n\nMe manda uma *foto* ou *descreva em texto* o que você comeu, ' +
           'que eu calculo as calorias e macros pra você.\n\nComandos:\n/hoje - resumo do dia'
       );
       return;
     }
-  }
 
-  let imagemBase64 = null;
-  let mimeType = null;
+    let imagemBase64 = null;
+    let mimeType = null;
 
-  if (message.hasMedia) {
-    const media = await message.downloadMedia();
-    if (media && media.mimetype.startsWith('image/')) {
-      imagemBase64 = media.data;
-      mimeType = media.mimetype;
-    } else {
-      // Áudio, vídeo, etc. Transcrição de áudio fica para uma próxima versão.
-      await message.reply(
+    // Se veio imagem, a Evolution API já manda o conteúdo em base64 direto no
+    // campo message.base64 (isso só funciha se "webhook_base64" estiver
+    // ativado nas configurações do webhook da instância - veja o README).
+    if (mensagem.imageMessage) {
+      if (dados.message.base64) {
+        imagemBase64 = dados.message.base64;
+        mimeType = mensagem.imageMessage.mimetype || 'image/jpeg';
+      } else {
+        await enviarTexto(
+          numero,
+          '⚠️ Recebi a imagem mas não consegui ler o conteúdo dela. Configuração do webhook precisa de "base64" ativado (veja o README).'
+        );
+        return;
+      }
+    } else if (mensagem.audioMessage) {
+      await enviarTexto(
+        numero,
         '🎤 Por enquanto eu ainda não entendo áudio nessa versão de teste — pode descrever em texto ' +
           'ou mandar uma foto da refeição?'
       );
       return;
+    } else if (!textoRecebido.trim()) {
+      return; // nada pra analisar
     }
-  } else if (!message.body || message.body.trim() === '') {
-    return; // nada pra analisar
-  }
 
-  await chat.sendStateTyping();
-
-  const analise = await analisarRefeicao({
-    texto: message.body,
-    imagemBase64,
-    mimeType,
-  });
-
-  if (analise) {
-    historico[userId].push({
-      data: new Date().toISOString(),
-      analise,
+    const analise = await analisarRefeicao({
+      texto: textoRecebido,
+      imagemBase64,
+      mimeType,
     });
-    salvarHistorico(historico);
-  }
 
-  await message.reply(formatarResposta(analise));
+    if (analise) {
+      historico[numero].push({
+        data: new Date().toISOString(),
+        analise,
+      });
+      salvarHistorico(historico);
+    }
+
+    await enviarTexto(numero, formatarResposta(analise));
+  } catch (erro) {
+    console.error('Erro processando webhook:', erro);
+  }
 });
 
-client.initialize();
+// Rota simples só pra confirmar que o servidor tá de pé
+app.get('/', (req, res) => {
+  res.send('ZapFit bot rodando! ✅');
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`\n✅ ZapFit (Evolution API) rodando na porta ${PORT}\n`);
+  console.log(`Configure o webhook da sua instância na Evolution API para apontar para:`);
+  console.log(`https://SEU-DOMINIO-DO-RAILWAY/webhook\n`);
+});
