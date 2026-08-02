@@ -1,16 +1,17 @@
 {
-  "name": "zapfit-mvp",
-  "version": "1.0.0",
-  "description": "Protótipo do ZapFit - bot de WhatsApp que analisa calorias de refeições",
+  "name": "zapfit-bot",
+  "version": "2.0.0",
+  "description": "Bot de WhatsApp que analisa refeições e calcula calorias/macros usando Claude, via Evolution API",
   "main": "bot.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
-    "whatsapp-web.js": "^1.26.0",
-    "qrcode-terminal": "^0.12.0",
     "@anthropic-ai/sdk": "^0.32.1",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }
