@@ -17,8 +17,6 @@
 require('dotenv').config();
 const express = require('express');
 const OpenAI = require('openai');
-const fs = require('fs');
-const path = require('path');
 
 // ---------- Configuração ----------
 
@@ -27,6 +25,7 @@ const REQUIRED_ENV = [
   'EVOLUTION_API_URL',
   'EVOLUTION_API_KEY',
   'EVOLUTION_INSTANCE',
+  'DATABASE_URL',
 ];
 
 for (const key of REQUIRED_ENV) {
@@ -63,29 +62,61 @@ console.log(`🔗 EVOLUTION_INSTANCE configurada como: "${EVOLUTION_INSTANCE}"`)
 const app = express();
 app.use(express.json({ limit: '20mb' })); // limite maior por causa das fotos em base64
 
-// ---------- Armazenamento (arquivo JSON simples - dá pra trocar por banco depois) ----------
+// ---------- Armazenamento (Postgres - um registro por usuário) ----------
+//
+// Guardamos os dados de cada usuário como um único campo JSON dentro do
+// banco (coluna "dados", tipo JSONB). Isso significa que a "forma" dos
+// dados em memória continua exatamente igual a antes (perfil, refeições,
+// atividades, etc.) - só troca ONDE isso é lido/salvo. Assim, nenhuma
+// lógica de negócio precisou ser reescrita pra essa migração.
 
-const DATA_FILE = path.join(__dirname, 'dados.json');
+const { Pool } = require('pg');
 
-function carregarDados() {
-  if (!fs.existsSync(DATA_FILE)) return {};
-  return JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('railway') ? { rejectUnauthorized: false } : undefined,
+});
+
+async function garantirTabela() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS usuarios (
+      numero TEXT PRIMARY KEY,
+      dados JSONB NOT NULL,
+      atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  console.log('🗄️  Tabela "usuarios" pronta no Postgres.');
 }
-function salvarDados(dados) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(dados, null, 2));
+
+function usuarioPadrao() {
+  return {
+    perfil: { completo: false, etapa: null, nome: null },
+    refeicoes: [],
+    atividades: [],
+  };
 }
 
-// Garante que o usuário tenha uma "ficha" (perfil + refeições) criada
-function pegarUsuario(dados, numero) {
-  if (!dados[numero]) {
-    dados[numero] = {
-      perfil: { completo: false, etapa: null, nome: null },
-      refeicoes: [],
-      atividades: [],
-    };
+// Busca o usuário no banco (ou devolve uma "ficha" nova em branco, sem
+// gravar nada ainda - só grava quando salvarUsuario for chamado).
+async function carregarUsuario(numero) {
+  const resultado = await pool.query('SELECT dados FROM usuarios WHERE numero = $1', [numero]);
+
+  if (resultado.rows.length === 0) {
+    return usuarioPadrao();
   }
-  if (!dados[numero].atividades) dados[numero].atividades = []; // usuários criados antes dessa feature
-  return dados[numero];
+
+  const usuario = resultado.rows[0].dados;
+  if (!usuario.atividades) usuario.atividades = []; // usuários salvos antes dessa feature
+  return usuario;
+}
+
+async function salvarUsuario(numero, usuario) {
+  await pool.query(
+    `INSERT INTO usuarios (numero, dados, atualizado_em)
+     VALUES ($1, $2, now())
+     ON CONFLICT (numero) DO UPDATE SET dados = $2, atualizado_em = now()`,
+    [numero, JSON.stringify(usuario)]
+  );
 }
 
 // O WhatsApp manda o nome de exibição do contato (pushName) em toda
@@ -869,8 +900,7 @@ app.post('/webhook', async (req, res) => {
       mensagem.imageMessage?.caption ||
       '';
 
-    const dadosGlobais = carregarDados();
-    const usuario = pegarUsuario(dadosGlobais, numero);
+    const usuario = await carregarUsuario(numero);
     const perfil = usuario.perfil;
     capturarNome(perfil, dados);
     const comando = textoRecebido.trim().toLowerCase();
@@ -881,14 +911,14 @@ app.post('/webhook', async (req, res) => {
     if (ehPrimeiraMensagem) {
       perfil.etapa = 'objetivo';
       await enviarTexto(numero, textoBoasVindas(perfil.nome));
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
     // --- Comandos disponíveis a qualquer momento ---
     if (comando === '/hoje') {
       await enviarTexto(numero, resumoDoDia(usuario));
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
@@ -898,14 +928,14 @@ app.post('/webhook', async (req, res) => {
       } else {
         await enviarTexto(numero, textoBoasVindas(perfil.nome));
       }
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
     if (comando === '/perfil refazer') {
       usuario.perfil = { completo: false, etapa: 'objetivo', nome: perfil.nome };
       await enviarTexto(numero, textoBoasVindas(perfil.nome));
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
@@ -918,7 +948,7 @@ app.post('/webhook', async (req, res) => {
           '*/perfil* - ver suas metas\n' +
           '*/perfil refazer* - refazer a entrevista inicial'
       );
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
@@ -965,7 +995,7 @@ app.post('/webhook', async (req, res) => {
         await enviarTexto(numero, resultado.resposta);
       }
 
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
@@ -1027,7 +1057,7 @@ app.post('/webhook', async (req, res) => {
         await estimarRefeicaoFutura({ numero, usuario, textoUsuario: textoOriginal });
       }
       usuario.aguardandoTipoRefeicaoAnalise = null;
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
@@ -1038,7 +1068,7 @@ app.post('/webhook', async (req, res) => {
       await enviarTexto(numero, `✅ Registrado!\n\n${formatarResposta(usuario.refeicaoPendente.analise)}`);
       usuario.refeicaoPendente = null;
       await talvezAvisarUsoExcessivo(numero, usuario);
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
@@ -1047,14 +1077,14 @@ app.post('/webhook', async (req, res) => {
     // correção (que ajusta a quantidade), aqui a refeição inteira é removida.
     if (REGEX_RETRATACAO.test(textoRecebido) && usuario.refeicoes.length > 0) {
       await removerUltimaRefeicao({ numero, usuario });
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
     // Correção da última refeição registrada (ex: "não era 2 ovos, era 1")
     if (!mensagem.imageMessage && REGEX_CORRECAO.test(textoRecebido) && usuario.refeicoes.length > 0) {
       await corrigirUltimaRefeicao({ numero, usuario, textoCorrecao: textoRecebido });
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
@@ -1062,7 +1092,7 @@ app.post('/webhook', async (req, res) => {
     // e soma de volta na meta do dia
     if (!mensagem.imageMessage && REGEX_ATIVIDADE_FISICA.test(textoRecebido)) {
       await registrarAtividadeFisica({ numero, perfil, usuario, textoUsuario: textoRecebido });
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
@@ -1070,7 +1100,7 @@ app.post('/webhook', async (req, res) => {
     // comum" genérico, já que essas perguntas também têm "?")
     if (!mensagem.imageMessage && REGEX_PERGUNTA_PORCAO.test(textoRecebido)) {
       await sugerirPorcao({ numero, perfil, usuario, textoUsuario: textoRecebido });
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
@@ -1079,7 +1109,7 @@ app.post('/webhook', async (req, res) => {
     // vale pra foto + legenda ambígua. Em vez de adivinhar, pergunta.
     if (REGEX_INTENCAO_FUTURA.test(textoRecebido) && REGEX_JA_COMI.test(textoRecebido)) {
       await perguntarSeJaComeu({ numero, usuario, textoOriginal: textoRecebido, imagemBase64, mimeType });
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
@@ -1091,14 +1121,14 @@ app.post('/webhook', async (req, res) => {
     if (REGEX_INTENCAO_FUTURA.test(textoRecebido)) {
       await avisarAnalisandoSeNecessario();
       await estimarRefeicaoFutura({ numero, usuario, textoUsuario: textoRecebido, imagemBase64, mimeType });
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
     // --- Perfil já completo: papo comum (sem foto) não vira "refeição" ---
     if (!mensagem.imageMessage && !mensagem.audioMessage && pareceConversaComum(textoRecebido)) {
       await responderConversa({ numero, perfil, usuario, textoUsuario: textoRecebido });
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
@@ -1126,7 +1156,7 @@ app.post('/webhook', async (req, res) => {
       // saudação/pergunta (ex: um comentário qualquer) - trata como conversa
       // em vez de mostrar um cartão de "0 calorias, nenhum alimento".
       await responderConversa({ numero, perfil, usuario, textoUsuario: textoRecebido });
-      salvarDados(dadosGlobais);
+      await salvarUsuario(numero, usuario);
       return;
     }
 
@@ -1136,7 +1166,7 @@ app.post('/webhook', async (req, res) => {
 
     await enviarTexto(numero, formatarResposta(analise));
     if (analise) await talvezAvisarUsoExcessivo(numero, usuario);
-    salvarDados(dadosGlobais);
+    await salvarUsuario(numero, usuario);
   } catch (erro) {
     console.error('Erro processando webhook:', erro);
   }
@@ -1148,8 +1178,17 @@ app.get('/', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`\n✅ NutriZap (Evolution API) rodando na porta ${PORT}\n`);
-  console.log(`Configure o webhook da sua instância na Evolution API para apontar para:`);
-  console.log(`https://SEU-DOMINIO-DO-RAILWAY/webhook\n`);
-});
+
+garantirTabela()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`\n✅ NutriZap (Evolution API) rodando na porta ${PORT}\n`);
+      console.log(`Configure o webhook da sua instância na Evolution API para apontar para:`);
+      console.log(`https://SEU-DOMINIO-DO-RAILWAY/webhook\n`);
+    });
+  })
+  .catch((erro) => {
+    console.error('\n❌ Não consegui conectar/preparar o banco de dados Postgres:', erro.message);
+    console.error('Confere se a variável DATABASE_URL está certa nas Variables do Railway.\n');
+    process.exit(1);
+  });
