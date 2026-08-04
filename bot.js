@@ -54,6 +54,13 @@ const META_PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID.trim();
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN.trim();
 const META_API_VERSION = 'v22.0';
 
+// Opcional: se configurado, o bot manda um WhatsApp pra esse número quando
+// algo dá errado (em vez de você só descobrir catando log no Railway).
+const ADMIN_WHATSAPP_NUMERO = process.env.ADMIN_WHATSAPP_NUMERO?.trim() || null;
+if (!ADMIN_WHATSAPP_NUMERO) {
+  console.log('⚠️  ADMIN_WHATSAPP_NUMERO não configurado - alertas de erro por WhatsApp estão desativados.');
+}
+
 console.log(`🔗 META_PHONE_NUMBER_ID configurado como: "${META_PHONE_NUMBER_ID}"`);
 
 const app = express();
@@ -472,6 +479,15 @@ descreva de forma mais genérica (ex: "salada de folhas verdes", "legumes variad
 nomear um alimento específico que pode estar errado. É sempre melhor ser genérico e correto
 do que específico e errado - a pessoa pode corrigir depois se quiser mais precisão.
 
+IMPORTANTE sobre quando PERGUNTAR em vez de estimar: às vezes a incerteza é pequena e não
+importa (ex: não saber se é 100g ou 120g de arroz - só estima e segue). Mas às vezes a
+incerteza é GRANDE o suficiente pra mudar o resultado de forma relevante (ex: uma bebida que
+pode ser água - 0 kcal - ou um suco açucarado - 150+ kcal; ou um prato que pode ter carne ou
+ser vegetariano). Nesses casos, marque "duvida_relevante": true e escreva uma pergunta curta e
+natural em "pergunta_esclarecimento" pra perguntar pro usuário, em vez de simplesmente chutar
+uma das opções. Só use isso quando a diferença for realmente grande - não pergunte por qualquer
+imprecisão pequena, senão fica cansativo pro usuário.
+
 Responda SEMPRE em formato JSON puro, sem markdown, sem texto antes ou depois, seguindo
 exatamente este formato:
 
@@ -482,6 +498,8 @@ exatamente este formato:
   "carboidrato_g": number,
   "gordura_g": number,
   "confianca": "alta" | "media" | "baixa",
+  "duvida_relevante": boolean,
+  "pergunta_esclarecimento": "string ou null - só preenche se duvida_relevante for true",
   "observacao": "string curta, opcional, ex: porção estimada visualmente"
 }
 
@@ -936,6 +954,38 @@ async function talvezAvisarUsoExcessivo(numero, usuario) {
 
 // ---------- Funções que chamam a API oficial da Meta (Graph API) ----------
 
+// Evita bombardear o admin com o mesmo alerta repetido em sequência (ex: se
+// a OpenAI cair, cada mensagem de cliente geraria um erro - sem esse
+// cooldown, isso viraria uma enxurrada de WhatsApp em poucos minutos).
+const ULTIMO_ALERTA_POR_TIPO = new Map();
+const COOLDOWN_ALERTA_MS = 15 * 60 * 1000; // 15 minutos
+
+async function notificarAdmin(tipo, detalhes) {
+  if (!ADMIN_WHATSAPP_NUMERO) return;
+
+  const agora = Date.now();
+  const ultimoEnvio = ULTIMO_ALERTA_POR_TIPO.get(tipo) || 0;
+  if (agora - ultimoEnvio < COOLDOWN_ALERTA_MS) return;
+  ULTIMO_ALERTA_POR_TIPO.set(tipo, agora);
+
+  try {
+    const url = `https://graph.facebook.com/${META_API_VERSION}/${META_PHONE_NUMBER_ID}/messages`;
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${META_ACCESS_TOKEN}` },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to: ADMIN_WHATSAPP_NUMERO,
+        type: 'text',
+        text: { body: `🚨 *NutriZap - alerta*\n\nTipo: ${tipo}\n${String(detalhes).slice(0, 800)}` },
+      }),
+    });
+  } catch (erro) {
+    // Se nem isso funcionar, só loga - não tem mais pra onde escalar daqui
+    console.error('Não consegui nem mandar o alerta de erro pro admin:', erro.message);
+  }
+}
+
 async function enviarTexto(numero, texto) {
   const url = `https://graph.facebook.com/${META_API_VERSION}/${META_PHONE_NUMBER_ID}/messages`;
   const resp = await fetch(url, {
@@ -955,6 +1005,12 @@ async function enviarTexto(numero, texto) {
   if (!resp.ok) {
     const erro = await resp.text();
     console.error('Erro ao enviar mensagem pela Meta Cloud API:', resp.status, erro);
+    // Evita loop infinito: só notifica o admin se quem falhou NÃO for o
+    // próprio número do admin (senão, se o problema for justo mandar pra
+    // ele, essa notificação também falharia pra sempre).
+    if (numero !== ADMIN_WHATSAPP_NUMERO) {
+      await notificarAdmin('Falha ao enviar mensagem (Meta)', `Status ${resp.status}: ${erro.slice(0, 300)}`);
+    }
   }
 }
 
@@ -1204,6 +1260,25 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
+    // Resposta a uma pergunta de esclarecimento que ficou pendente (ex: "é
+    // água ou suco?" depois de uma foto ambígua de bebida)
+    if (usuario.aguardandoEsclarecimento) {
+      const { contextoAnterior, perguntaFeita } = usuario.aguardandoEsclarecimento;
+      usuario.aguardandoEsclarecimento = null;
+
+      const contexto =
+        `Você tinha perguntado: "${perguntaFeita}" sobre uma refeição/bebida (itens identificados ` +
+        `até agora: ${contextoAnterior}). O usuário respondeu: "${textoRecebido}". Finalize a análise ` +
+        `nutricional completa considerando essa resposta e retorne o JSON.`;
+
+      const analiseFinal = await chamarIA({ systemPrompt: SYSTEM_PROMPT_REFEICAO, texto: contexto });
+      if (analiseFinal) usuario.refeicoes.push({ data: new Date().toISOString(), analise: analiseFinal });
+      await enviarTexto(numero, formatarResposta(analiseFinal));
+      if (analiseFinal) await talvezAvisarUsoExcessivo(numero, usuario);
+      await salvarUsuario(numero, usuario);
+      return;
+    }
+
     // Resposta a uma pergunta de "você já comeu ou ainda vai comer?" que
     // ficou pendente de uma mensagem ambígua anterior.
     if (usuario.aguardandoTipoRefeicao) {
@@ -1329,6 +1404,18 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
+    // A IA identificou uma dúvida grande o suficiente pra mudar o resultado
+    // (ex: "é água ou suco?") - pergunta em vez de chutar e registrar errado.
+    if (analise?.duvida_relevante && analise?.pergunta_esclarecimento) {
+      usuario.aguardandoEsclarecimento = {
+        contextoAnterior: JSON.stringify(analise.alimentos || []),
+        perguntaFeita: analise.pergunta_esclarecimento,
+      };
+      await enviarTexto(numero, `🤔 ${analise.pergunta_esclarecimento}`);
+      await salvarUsuario(numero, usuario);
+      return;
+    }
+
     if (analise) {
       usuario.refeicoes.push({ data: new Date().toISOString(), analise });
     }
@@ -1338,6 +1425,7 @@ app.post('/webhook', async (req, res) => {
     await salvarUsuario(numero, usuario);
   } catch (erro) {
     console.error('Erro processando webhook:', erro);
+    await notificarAdmin('Erro processando mensagem', erro.message || String(erro));
   }
 });
 
@@ -1354,10 +1442,14 @@ garantirTabela()
       console.log(`\n✅ NutriZap (Evolution API) rodando na porta ${PORT}\n`);
       console.log(`Configure o webhook da sua instância na Evolution API para apontar para:`);
       console.log(`https://SEU-DOMINIO-DO-RAILWAY/webhook\n`);
+      // Serve tanto pra confirmar deploy quanto como o aviso de "voltei ao
+      // ar" depois de qualquer crash/reinício.
+      notificarAdmin('Bot iniciado', `NutriZap subiu e está rodando na porta ${PORT}.`);
     });
   })
-  .catch((erro) => {
+  .catch(async (erro) => {
     console.error('\n❌ Não consegui conectar/preparar o banco de dados Postgres:', erro.message);
     console.error('Confere se a variável DATABASE_URL está certa nas Variables do Railway.\n');
+    await notificarAdmin('Falha ao iniciar - banco de dados', erro.message || String(erro));
     process.exit(1);
   });
