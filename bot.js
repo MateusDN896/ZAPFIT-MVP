@@ -833,10 +833,25 @@ function formatarRespostaHipotetica(analise) {
   );
 }
 
+// Calcula a data (YYYY-MM-DD) no fuso de Brasília, não em UTC. Sem isso, o
+// bot considerava "amanhã" toda vez que alguém registrava uma refeição
+// entre 21h e meia-noite (horário de Brasília), porque UTC já tinha virado
+// o dia. Usa Intl.DateTimeFormat em vez de só subtrair 3 horas na mão, pra
+// lidar sozinho com qualquer mudança de horário de verão que volte a existir.
+function dataBrasilia(dataOuTexto) {
+  const data = dataOuTexto ? new Date(dataOuTexto) : new Date();
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(data);
+}
+
 function calcularTotaisHoje(usuario) {
-  const hoje = new Date().toISOString().slice(0, 10);
-  const registrosHoje = (usuario.refeicoes || []).filter((r) => r.data.startsWith(hoje));
-  const atividadesHoje = (usuario.atividades || []).filter((a) => a.data.startsWith(hoje));
+  const hoje = dataBrasilia();
+  const registrosHoje = (usuario.refeicoes || []).filter((r) => dataBrasilia(r.data) === hoje);
+  const atividadesHoje = (usuario.atividades || []).filter((a) => dataBrasilia(a.data) === hoje);
 
   const totais = registrosHoje.reduce(
     (acc, r) => ({
@@ -899,8 +914,7 @@ function resumoDoDia(usuario) {
 // é saudável), aparece no máximo 1x por dia, e nunca esconde nada: só
 // descreve exatamente o que está acontecendo (muitos registros hoje).
 function jaAvisouUsoExcessivoHoje(usuario) {
-  const hoje = new Date().toISOString().slice(0, 10);
-  return usuario.avisoUsoExcessivoEm === hoje;
+  return usuario.avisoUsoExcessivoEm === dataBrasilia();
 }
 
 async function talvezAvisarUsoExcessivo(numero, usuario) {
@@ -910,7 +924,7 @@ async function talvezAvisarUsoExcessivo(numero, usuario) {
   if (registrosHoje.length < LIMITE_DIARIO_PARA_AVISO) return;
   if (jaAvisouUsoExcessivoHoje(usuario)) return;
 
-  usuario.avisoUsoExcessivoEm = new Date().toISOString().slice(0, 10);
+  usuario.avisoUsoExcessivoEm = dataBrasilia();
 
   await enviarTexto(
     numero,
