@@ -121,7 +121,31 @@ async function garantirTabela() {
       atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
-  console.log('🗄️  Tabela "usuarios" pronta no Postgres.');
+
+  // A Meta reenvia a MESMA mensagem se o webhook demorar pra responder (ou
+  // em qualquer instabilidade de rede) - sem isso, uma foto podia ser
+  // processada 2x, gastando IA em dobro e contando 2x na régua do trial.
+  // Guarda o ID de cada mensagem já processada; se chegar de novo, ignora.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mensagens_processadas (
+      message_id TEXT PRIMARY KEY,
+      processado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  console.log('🗄️  Tabelas "usuarios" e "mensagens_processadas" prontas no Postgres.');
+}
+
+// true se essa mensagem JÁ tinha sido processada antes (reenvio da Meta).
+// Usa INSERT ... ON CONFLICT DO NOTHING pra ser atômico - mesmo se duas
+// cópias da mesma mensagem chegarem quase juntas, só uma passa.
+async function jaProcessadaAntes(messageId) {
+  if (!messageId) return false; // sem ID pra checar, deixa passar
+  const resultado = await pool.query(
+    'INSERT INTO mensagens_processadas (message_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING message_id',
+    [messageId]
+  );
+  return resultado.rows.length === 0; // não inseriu nada = já existia
 }
 
 function usuarioPadrao() {
@@ -167,14 +191,25 @@ function capturarNome(perfil, dadosWebhook) {
 
 // Detecta mensagens de "papo comum" (saudação, pergunta, agradecimento) que
 // NÃO são descrição de refeição - pra não tentar analisar "oi" como comida.
+//
+// IMPORTANTE: tem que bater com a MENSAGEM INTEIRA (só tolera pontuação/
+// emoji sobrando no final), não só o INÍCIO dela. Antes disso era só "^", o
+// que fazia "Oi, acabei de comer uma concha de feijão..." ser tratado como
+// simples "oi" (por começar com a saudação) e a refeição inteira ser
+// ignorada, virando um comentário genérico sem calorias/macros nenhum.
 const REGEX_SAUDACAO =
-  /^(oi+|ol[áa]|opa|e\s?a[íi]|eae|salve|fala|bom\s?dia|boa\s?tarde|boa\s?noite|tudo\s?bem\??|blz|beleza|valeu|obrigad[oa]|ok|td\s?bem|como\s?vai|tranquilo|tranquila)\b/i;
+  /^(oi+|ol[áa]|opa|e\s?a[íi]|eae|salve|fala|bom\s?dia|boa\s?tarde|boa\s?noite|tudo\s?bem\??|blz|beleza|valeu|obrigad[oa]|ok|td\s?bem|como\s?vai|tranquilo|tranquila)[\s,!.👍😊🙂✅]*$/i;
 
 function pareceConversaComum(texto) {
   const t = (texto || '').trim();
   if (!t) return false;
   if (REGEX_SAUDACAO.test(t)) return true;
-  if (t.includes('?')) return true; // pergunta, não é registro de refeição
+  // Pergunta curta ("como funciona?", "e proteína?") ainda conta como papo
+  // comum direto. Pergunta LONGA pode ser uma refeição descrita com uma
+  // pergunta no meio/fim (ex: "comi X, Y e Z, tava bom, tá dentro da
+  // minha meta?") - nesse caso deixa a IA decidir, porque ela já sabe cair
+  // de volta pra conversa sozinha se não achar nada de refeição de verdade.
+  if (t.includes('?') && t.length <= 60) return true;
   return false;
 }
 
@@ -182,6 +217,13 @@ function pareceConversaComum(texto) {
 // ("não era 2 ovos, era 1") quanto ingrediente errado ("não tinha repolho")
 const REGEX_CORRECAO =
   /\b(na verdade|me enganei|errei|foi engano|não era|nao era|não foi|nao foi|não tinha|nao tinha|não tem|nao tem|corrige|corrigir|esquece,? era|desconsidera,? era|tira o|tira a)\b/i;
+
+// Usuário COMPLEMENTANDO a última refeição com uma informação que faltou -
+// diferente de corrigir (não é "trocar" nada, é "somar" algo que ele
+// esqueceu de falar antes). Ex: "também tinha molho", "esqueci de mencionar
+// que tinha queijo", "ah, e também tomei um suco".
+const REGEX_ADICAO =
+  /\b(tamb[ée]m tinha|tamb[ée]m tem|tamb[ée]m tomei|tamb[ée]m comi|esqueci de (falar|mencionar|dizer)|faltou (dizer|falar|mencionar)|ah,? e (tamb[ée]m|tinha|tomei|comi)|acrescenta|adiciona|complementando)\b/i;
 
 // Usuário perguntando se/quanto pode comer algo específico - tanto no
 // formato "quanto posso comer" quanto "posso comer X?" (permissão)
@@ -196,8 +238,15 @@ const REGEX_INTENCAO_FUTURA =
   /\b(vou (comer|tomar|almo[çc]ar|jantar|lanchar|beliscar)|pretendo (comer|tomar)|quero (comer|tomar)|penso em (comer|tomar)|acho que vou (comer|tomar)|se eu (comer|comesse|tomar|tomasse)|se (comer|comesse|tomar|tomasse)|caso eu (coma|tome)|caso (coma|tome))\b/i;
 
 // Usuário confirmando que já comeu uma refeição que tinha ficado "pendente"
+//
+// IMPORTANTE: também precisa bater com a MENSAGEM INTEIRA, mesmo motivo do
+// REGEX_SAUDACAO acima. Sem o "$" no final, uma mensagem tipo "Comi um
+// prato de arroz, feijão, salada e um café" (uma refeição NOVA e totalmente
+// diferente) batia só por começar com "Comi", e o bot confirmava por engano
+// a estimativa antiga que tinha ficado pendente (ex: de um dia anterior),
+// em vez de reconhecer que era uma refeição nova.
 const REGEX_CONFIRMACAO_REFEICAO =
-  /^(sim|comi|j[áa] comi|confirmo|isso mesmo|comi sim|confere|correto|exato)\b/i;
+  /^(sim|comi|j[áa] comi|confirmo|isso mesmo|comi sim|confere|correto|exato)[\s,!.👍✅🙌😉]*$/i;
 
 // Sinal de que a pessoa JÁ comeu (usado só pra detectar ambiguidade quando
 // aparece junto com um sinal de intenção futura na mesma mensagem)
@@ -684,9 +733,11 @@ async function sugerirPorcao({ numero, perfil, usuario, textoUsuario }) {
   );
 }
 
-// Usuário corrigindo a última refeição registrada (ex: "não era 2 ovos, era 1").
-// Substitui o último registro em vez de somar em cima dele.
-async function corrigirUltimaRefeicao({ numero, usuario, textoCorrecao }) {
+// Usuário corrigindo OU complementando a última refeição registrada.
+//   tipo 'substituicao' (ex: "não era 2 ovos, era 1") -> TROCA a informação errada
+//   tipo 'adicao' (ex: "também tinha molho") -> SOMA algo que faltou, sem
+//   mexer no que já estava certo
+async function corrigirUltimaRefeicao({ numero, usuario, textoCorrecao, tipo = 'substituicao' }) {
   const ultima = usuario.refeicoes[usuario.refeicoes.length - 1];
 
   if (!ultima) {
@@ -697,17 +748,24 @@ async function corrigirUltimaRefeicao({ numero, usuario, textoCorrecao }) {
     return;
   }
 
+  const instrucao =
+    tipo === 'adicao'
+      ? 'O usuário está ACRESCENTANDO uma informação que esqueceu de mencionar antes (ex: um ingrediente ou uma bebida a mais). ' +
+        'SOME isso ao que já tinha sido identificado - não remova nem troque nada que já estava certo, só inclua o que faltava.'
+      : 'O usuário está CORRIGINDO uma informação que ficou errada (ex: quantidade ou item errado). ' +
+        'SUBSTITUA o que estava errado pelo que ele disse agora - não some em cima, troque.';
+
   const contexto =
     `A última refeição registrada foi interpretada assim: ${JSON.stringify(ultima.analise.alimentos)}, ` +
-    `totalizando ${ultima.analise.calorias_kcal} kcal. O usuário está corrigindo essa informação: "${textoCorrecao}". ` +
-    'Refaça a análise levando em conta a correção (ex: se ele disse que era 1 ovo em vez de 2, ' +
-    'recalcule considerando só 1 ovo, não os dois).';
+    `totalizando ${ultima.analise.calorias_kcal} kcal. ${instrucao} O usuário disse: "${textoCorrecao}". ` +
+    'Refaça a análise nutricional completa levando isso em conta.';
 
   const analiseCorrigida = await chamarIA({ systemPrompt: SYSTEM_PROMPT_REFEICAO, texto: contexto });
 
   if (analiseCorrigida) {
     usuario.refeicoes[usuario.refeicoes.length - 1] = { data: ultima.data, analise: analiseCorrigida };
-    await enviarTexto(numero, `✅ Corrigido!\n\n${formatarResposta(analiseCorrigida)}`);
+    const emoji = tipo === 'adicao' ? '✅ Adicionado!' : '✅ Corrigido!';
+    await enviarTexto(numero, `${emoji}\n\n${formatarResposta(analiseCorrigida)}`);
   } else {
     await enviarTexto(numero, '⚠️ Não consegui refazer o cálculo. Pode descrever a refeição certinha, do zero?');
   }
@@ -996,18 +1054,87 @@ function passouDoLimiteTeste(usuario, numero) {
   return usuario.refeicoes.length >= LIMITE_REFEICOES_TESTE;
 }
 
-async function avisarLimiteTesteAtingido(numero) {
-  const linkOuAviso = CAKTO_CHECKOUT_URL
-    ? `assina aqui, é rapidinho:\n${CAKTO_CHECKOUT_URL}`
-    : 'me chama que eu te mando o link de assinatura (ainda não está configurado no bot).';
+// Chamada depois de QUALQUER refeição nova ser registrada (não importa por
+// qual dos fluxos - normal, esclarecimento, confirmação de pendente, etc).
+// Dispara os dois avisos progressivos:
+//   - penúltima grátis: aviso curto, não atrapalha o resultado da análise
+//   - última grátis: já manda a oferta completa NA HORA, aproveitando o
+//     usuário ainda "quente" (acabou de ver o resultado, tá satisfeito) -
+//     em vez de esperar ela tentar de novo e só aí mostrar o link, que
+//     perde o timing emocional da venda.
+async function avisarProgressoTrial(numero, usuario) {
+  if (usuario.assinatura?.ativa) return;
+  if (TESTADORES_ISENTOS.includes(numero)) return;
 
-  await enviarTexto(
-    numero,
-    `🎉 Você já testou o NutriZap de graça (${LIMITE_REFEICOES_TESTE} refeições)!\n\n` +
-      `Gostou de ver suas calorias e macros na hora? Pra continuar registrando sem parar, ` +
-      `${linkOuAviso}\n\n` +
-      `Assim que o pagamento cair, é só voltar a mandar suas refeições normalmente. 🙌`
-  );
+  const restantes = LIMITE_REFEICOES_TESTE - usuario.refeicoes.length;
+
+  if (restantes === 1) {
+    await enviarTexto(numero, '💚 Você ainda tem *1 análise gratuita* disponível. Aproveite! 😊');
+    return;
+  }
+
+  if (restantes === 0) {
+    await enviarTexto(
+      numero,
+      '💚 Essa foi sua última análise gratuita! Espero que o NutriZap tenha ajudado você a entender ' +
+        'melhor sua alimentação. 😊'
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    const linkOuAviso = CAKTO_CHECKOUT_URL
+      ? `💚 Continue usando o NutriZap por R$29,90/mês:\n${CAKTO_CHECKOUT_URL}`
+      : 'me chama que eu te mando o link de assinatura (ainda não está configurado no bot).';
+
+    await enviarTexto(
+      numero,
+      'Com o plano você continua tendo:\n' +
+        '✅ Análises ilimitadas\n' +
+        '✅ Tudo direto no WhatsApp\n' +
+        '✅ Respostas em poucos segundos\n\n' +
+        `${linkOuAviso}\n\n` +
+        'Assim que o pagamento for confirmado, é só voltar aqui. Eu continuo exatamente de onde paramos. 😊'
+    );
+  }
+}
+
+// Chamada quando a pessoa TENTA de novo depois de já ter estourado o limite
+// (5ª+ tentativa). A oferta completa já foi mandada na 4ª refeição (ver
+// avisarProgressoTrial acima), então aqui é só um lembrete leve com o link -
+// sem repetir o pitch inteiro de novo, senão fica repetitivo/chato.
+async function avisarLimiteTesteAtingido(numero) {
+  const linkOuAviso = CAKTO_CHECKOUT_URL || '(peça o link de assinatura pro suporte)';
+  await enviarTexto(numero, `Ainda por aqui! 😊 Quando quiser continuar, é só usar esse link:\n${linkOuAviso}`);
+}
+
+// ---------- Transcrição de áudio (Whisper, via API da OpenAI) ----------
+
+const DURACAO_MAXIMA_AUDIO_SEGUNDOS = 30;
+
+// Transcreve um áudio (base64) pra texto. Devolve { texto, duracaoSegundos }
+// ou null se falhar. O áudio do WhatsApp chega em .ogg (codec opus), que a
+// API da OpenAI aceita direto - não precisa converter formato.
+async function transcreverAudio(audioBase64, mimeType) {
+  try {
+    const buffer = Buffer.from(audioBase64, 'base64');
+    const extensao = mimeType?.includes('ogg') ? 'ogg' : 'mp4'; // mp4 cobre o audio/mp4 usado às vezes pelo WhatsApp iOS
+    const arquivo = await OpenAI.toFile(buffer, `audio.${extensao}`);
+
+    const resultado = await openai.audio.transcriptions.create({
+      model: 'whisper-1',
+      file: arquivo,
+      language: 'pt',
+      response_format: 'verbose_json', // pra vir a duração junto, sem chamada extra
+    });
+
+    return {
+      texto: resultado.text?.trim() || '',
+      duracaoSegundos: resultado.duration || null,
+    };
+  } catch (erro) {
+    console.error('Erro ao transcrever áudio:', erro.message);
+    return null;
+  }
 }
 
 // ---------- Funções que chamam a API oficial da Meta (Graph API) ----------
@@ -1268,11 +1395,26 @@ app.post('/webhook', async (req, res) => {
 
     const numero = msgMeta.from; // número já vem só com dígitos, ex: "5522999999999"
 
+    // Proteção contra reenvio: se o webhook demorar pra responder (ou
+    // qualquer instabilidade), a Meta manda a MESMA mensagem de novo. Sem
+    // essa checagem, isso gastaria IA em dobro e contaria 2x no trial.
+    if (await jaProcessadaAntes(msgMeta.id)) {
+      console.log(`↩️  Mensagem ${msgMeta.id} já tinha sido processada - ignorando reenvio da Meta.`);
+      return;
+    }
+
     // Baixa a imagem ANTES de montar o adaptador, se for o caso (a Meta só
     // manda um "media ID" no webhook, não a imagem em si)
     let imagemBase64Meta = null;
     if (msgMeta.type === 'image') {
       imagemBase64Meta = await baixarMidiaMeta(msgMeta.image.id);
+    }
+
+    // Mesma lógica pro áudio - baixa o arquivo aqui, transcreve mais abaixo
+    // (perto de onde o resto da lógica de texto já existe).
+    let audioBase64Meta = null;
+    if (msgMeta.type === 'audio') {
+      audioBase64Meta = await baixarMidiaMeta(msgMeta.audio.id);
     }
 
     // Monta um "mensagem" e um "dados" no MESMO formato que o resto do
@@ -1287,16 +1429,16 @@ app.post('/webhook', async (req, res) => {
         mimetype: msgMeta.image.mime_type || 'image/jpeg',
       };
     } else if (msgMeta.type === 'audio') {
-      mensagem.audioMessage = {};
+      mensagem.audioMessage = { mimetype: msgMeta.audio.mime_type || 'audio/ogg' };
     }
 
     const dados = {
       pushName: valor?.contacts?.[0]?.profile?.name || null,
-      message: { base64: imagemBase64Meta },
+      message: { base64: imagemBase64Meta, audioBase64: audioBase64Meta },
       key: { fromMe: false, remoteJid: numero },
     };
 
-    const textoRecebido =
+    let textoRecebido =
       mensagem.conversation ||
       mensagem.extendedTextMessage?.text ||
       mensagem.imageMessage?.caption ||
@@ -1472,11 +1614,33 @@ app.post('/webhook', async (req, res) => {
         return;
       }
     } else if (mensagem.audioMessage) {
-      await enviarTexto(
-        numero,
-        '🎤 Por enquanto eu ainda não entendo áudio — pode descrever em texto ou mandar uma foto da refeição?'
-      );
-      return;
+      if (!dados.message.audioBase64) {
+        await enviarTexto(
+          numero,
+          '⚠️ Recebi o áudio mas não consegui baixar o conteúdo dele. Pode tentar de novo ou descrever em texto?'
+        );
+        return;
+      }
+
+      const transcricao = await transcreverAudio(dados.message.audioBase64, mensagem.audioMessage.mimetype);
+
+      if (!transcricao || !transcricao.texto) {
+        await enviarTexto(numero, '⚠️ Não consegui entender esse áudio. Pode tentar de novo ou descrever em texto?');
+        return;
+      }
+
+      // A partir daqui, o áudio transcrito segue o MESMO caminho de
+      // qualquer mensagem de texto normal - mesma detecção de refeição,
+      // correção, hipotético, tudo. Nenhum código novo de roteamento.
+      textoRecebido = transcricao.texto;
+
+      if (transcricao.duracaoSegundos && transcricao.duracaoSegundos > DURACAO_MAXIMA_AUDIO_SEGUNDOS) {
+        await enviarTexto(
+          numero,
+          `🎤 Esse áudio passou de ${DURACAO_MAXIMA_AUDIO_SEGUNDOS}s - ainda assim usei o que consegui entender, ` +
+            `mas áudios mais curtos funcionam melhor da próxima vez!`
+        );
+      }
     }
 
     async function avisarAnalisandoSeNecessario() {
@@ -1501,6 +1665,7 @@ app.post('/webhook', async (req, res) => {
       if (analiseFinal) usuario.refeicoes.push({ data: new Date().toISOString(), analise: analiseFinal });
       await enviarTexto(numero, formatarResposta(analiseFinal));
       if (analiseFinal) await talvezAvisarUsoExcessivo(numero, usuario);
+      if (analiseFinal) await avisarProgressoTrial(numero, usuario);
       await salvarUsuario(numero, usuario);
       return;
     }
@@ -1523,6 +1688,7 @@ app.post('/webhook', async (req, res) => {
         if (analise) usuario.refeicoes.push({ data: new Date().toISOString(), analise });
         await enviarTexto(numero, formatarResposta(analise));
         await talvezAvisarUsoExcessivo(numero, usuario);
+        if (analise) await avisarProgressoTrial(numero, usuario);
       } else {
         await estimarRefeicaoFutura({ numero, usuario, textoUsuario: textoOriginal });
       }
@@ -1538,6 +1704,7 @@ app.post('/webhook', async (req, res) => {
       await enviarTexto(numero, `✅ Registrado!\n\n${formatarResposta(usuario.refeicaoPendente.analise)}`);
       usuario.refeicaoPendente = null;
       await talvezAvisarUsoExcessivo(numero, usuario);
+      await avisarProgressoTrial(numero, usuario);
       await salvarUsuario(numero, usuario);
       return;
     }
@@ -1551,9 +1718,17 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // Correção da última refeição registrada (ex: "não era 2 ovos, era 1")
+    // Correção da última refeição ("não era 2 ovos, era 1") OU complemento
+    // ("também tinha molho") - checa correção primeiro porque é o caso mais
+    // específico; se não bater, tenta adição.
     if (!mensagem.imageMessage && REGEX_CORRECAO.test(textoRecebido) && usuario.refeicoes.length > 0) {
-      await corrigirUltimaRefeicao({ numero, usuario, textoCorrecao: textoRecebido });
+      await corrigirUltimaRefeicao({ numero, usuario, textoCorrecao: textoRecebido, tipo: 'substituicao' });
+      await salvarUsuario(numero, usuario);
+      return;
+    }
+
+    if (!mensagem.imageMessage && REGEX_ADICAO.test(textoRecebido) && usuario.refeicoes.length > 0) {
+      await corrigirUltimaRefeicao({ numero, usuario, textoCorrecao: textoRecebido, tipo: 'adicao' });
       await salvarUsuario(numero, usuario);
       return;
     }
@@ -1595,8 +1770,10 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // --- Perfil já completo: papo comum (sem foto) não vira "refeição" ---
-    if (!mensagem.imageMessage && !mensagem.audioMessage && pareceConversaComum(textoRecebido)) {
+    // --- Perfil já completo: papo comum não vira "refeição" ---
+    // (áudio transcrito conta igual texto normal agora - só foto continua de
+    // fora, porque uma foto sempre merece ser analisada, mesmo sem legenda)
+    if (!mensagem.imageMessage && pareceConversaComum(textoRecebido)) {
       await responderConversa({ numero, perfil, usuario, textoUsuario: textoRecebido });
       await salvarUsuario(numero, usuario);
       return;
@@ -1644,10 +1821,17 @@ app.post('/webhook', async (req, res) => {
 
     if (analise) {
       usuario.refeicoes.push({ data: new Date().toISOString(), analise });
+      // Se tinha uma estimativa hipotética antiga esperando confirmação e o
+      // usuário simplesmente seguiu em frente com uma refeição nova (sem
+      // confirmar nem negar a de antes), descarta a antiga - senão ela pode
+      // "ressurgir" e ser confirmada por engano dias depois, com um "comi"
+      // bem solto que na real era sobre a refeição de agora.
+      usuario.refeicaoPendente = null;
     }
 
     await enviarTexto(numero, formatarResposta(analise));
     if (analise) await talvezAvisarUsoExcessivo(numero, usuario);
+    if (analise) await avisarProgressoTrial(numero, usuario);
     await salvarUsuario(numero, usuario);
   } catch (erro) {
     console.error('Erro processando webhook:', erro);
