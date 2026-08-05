@@ -63,6 +63,38 @@ if (!ADMIN_WHATSAPP_NUMERO) {
 
 console.log(`🔗 META_PHONE_NUMBER_ID configurado como: "${META_PHONE_NUMBER_ID}"`);
 
+// ---------- Trial grátis + assinatura ----------
+//
+// Quantas refeições a pessoa pode registrar de graça antes do bot pedir
+// pra assinar. Pode ajustar sem mexer no código, só trocando a variável
+// LIMITE_REFEICOES_TESTE no Railway.
+const LIMITE_REFEICOES_TESTE = Number(process.env.LIMITE_REFEICOES_TESTE || 4);
+
+// Link de checkout da assinatura (Cakto, Mercado Pago, ou o que você
+// estiver usando). Enquanto não tiver o link real, o bot cai num aviso
+// genérico em vez de quebrar.
+const CAKTO_CHECKOUT_URL = process.env.CAKTO_CHECKOUT_URL?.trim() || null;
+if (!CAKTO_CHECKOUT_URL) {
+  console.log('⚠️  CAKTO_CHECKOUT_URL não configurado - o bot vai avisar o limite mas sem link de pagamento.');
+}
+
+// Segredo compartilhado pra validar que a chamada em /webhook/cakto
+// realmente veio da Cakto (e não de qualquer um mandando um POST
+// forjado marcando gente como "assinante" de graça). Configure esse
+// mesmo valor lá no painel da Cakto quando for cadastrar o webhook.
+const CAKTO_WEBHOOK_SECRET = process.env.CAKTO_WEBHOOK_SECRET?.trim() || null;
+
+// Números que NUNCA batem o limite de trial - uso pessoal/família testando
+// o bot, não faz sentido pedir pra essas pessoas assinarem. Dá pra
+// sobrescrever via variável TESTADORES_ISENTOS no Railway (separado por
+// vírgula), mas já vem com um padrão configurado.
+const TESTADORES_ISENTOS = (
+  process.env.TESTADORES_ISENTOS || '5522999297732,5522998011508,5522998034693'
+)
+  .split(',')
+  .map((n) => n.trim())
+  .filter(Boolean);
+
 const app = express();
 app.use(express.json({ limit: '20mb' })); // limite maior por causa das fotos em base64
 
@@ -97,6 +129,7 @@ function usuarioPadrao() {
     perfil: { completo: false, etapa: null, nome: null },
     refeicoes: [],
     atividades: [],
+    assinatura: { ativa: false, ativadaEm: null, origem: null },
   };
 }
 
@@ -111,6 +144,7 @@ async function carregarUsuario(numero) {
 
   const usuario = resultado.rows[0].dados;
   if (!usuario.atividades) usuario.atividades = []; // usuários salvos antes dessa feature
+  if (!usuario.assinatura) usuario.assinatura = { ativa: false, ativadaEm: null, origem: null };
   return usuario;
 }
 
@@ -952,6 +986,30 @@ async function talvezAvisarUsoExcessivo(numero, usuario) {
   );
 }
 
+// Verdadeiro quando a pessoa já usou as refeições grátis e ainda não
+// assinou. Reaproveita usuario.refeicoes.length como contador - não
+// precisa de um campo novo só pra isso. Números em TESTADORES_ISENTOS
+// nunca são bloqueados, independente de quantas refeições registrarem.
+function passouDoLimiteTeste(usuario, numero) {
+  if (usuario.assinatura?.ativa) return false;
+  if (TESTADORES_ISENTOS.includes(numero)) return false;
+  return usuario.refeicoes.length >= LIMITE_REFEICOES_TESTE;
+}
+
+async function avisarLimiteTesteAtingido(numero) {
+  const linkOuAviso = CAKTO_CHECKOUT_URL
+    ? `assina aqui, é rapidinho:\n${CAKTO_CHECKOUT_URL}`
+    : 'me chama que eu te mando o link de assinatura (ainda não está configurado no bot).';
+
+  await enviarTexto(
+    numero,
+    `🎉 Você já testou o NutriZap de graça (${LIMITE_REFEICOES_TESTE} refeições)!\n\n` +
+      `Gostou de ver suas calorias e macros na hora? Pra continuar registrando sem parar, ` +
+      `${linkOuAviso}\n\n` +
+      `Assim que o pagamento cair, é só voltar a mandar suas refeições normalmente. 🙌`
+  );
+}
+
 // ---------- Funções que chamam a API oficial da Meta (Graph API) ----------
 
 // Evita bombardear o admin com o mesmo alerta repetido em sequência (ex: se
@@ -1056,6 +1114,87 @@ app.get('/webhook', (req, res) => {
   }
 });
 
+// ---------- Rota que recebe a confirmação de pagamento da Cakto ----------
+//
+// 🚧 ESQUELETO - AINDA NÃO TESTADO COM UM PAYLOAD REAL DA CAKTO. 🚧
+//
+// Ainda não temos o produto/checkout criado lá, então não sei o formato
+// exato que a Cakto manda. O que precisa acontecer antes de confiar nessa
+// rota de verdade:
+//   1. Criar o produto e o checkout no painel da Cakto
+//   2. Configurar um webhook lá apontando pra:
+//      https://SEU-DOMINIO-RAILWAY/webhook/cakto
+//   3. Fazer uma compra de teste (ou usar o "testar webhook" deles, se tiver)
+//   4. Copiar o JSON exato que chegou aqui e me mandar - eu ajusto os nomes
+//      de campo abaixo (hoje estou tentando alguns nomes prováveis, mas
+//      pode não bater exatamente com o que a Cakto realmente envia)
+//   5. Confirmar como a Cakto manda o "segredo" do webhook pra validar que a
+//      chamada é legítima (header customizado? query string? assinatura
+//      HMAC no corpo? cada plataforma faz diferente)
+//
+// Até isso estar confirmado, o jeito seguro de liberar cliente é o comando
+// manual */liberar 5522999999999* que já está funcionando.
+
+app.post('/webhook/cakto', async (req, res) => {
+  try {
+    // Validação básica de segredo compartilhado - AJUSTAR quando soubermos
+    // como a Cakto realmente manda essa validação (pode não ser um header
+    // "x-webhook-secret", isso é só um palpite razoável por enquanto).
+    if (CAKTO_WEBHOOK_SECRET && req.headers['x-webhook-secret'] !== CAKTO_WEBHOOK_SECRET) {
+      console.error('❌ Webhook da Cakto rejeitado - segredo não bateu.');
+      return res.sendStatus(401);
+    }
+
+    const body = req.body || {};
+    console.log('📦 Payload recebido em /webhook/cakto:', JSON.stringify(body));
+
+    // Só processa se for um evento de pagamento aprovado. O nome exato do
+    // campo de status/evento PRECISA ser confirmado com um payload real.
+    const status = body?.event || body?.status || body?.data?.status;
+    const statusIndicaPago = /aprovad|paid|approved|pago/i.test(status || '');
+    if (!statusIndicaPago) {
+      console.log(`ℹ️  Evento da Cakto ignorado (status: "${status}") - não parece pagamento aprovado.`);
+      return res.sendStatus(200);
+    }
+
+    // Tenta achar o telefone do cliente em alguns caminhos prováveis do
+    // JSON. Isso também precisa ser confirmado/ajustado com o payload real -
+    // o telefone só vai vir se o campo de telefone existir no checkout e a
+    // pessoa preencher com o mesmo número que usa no WhatsApp do bot.
+    const telefoneBruto =
+      body?.data?.customer?.phone ||
+      body?.customer?.phone ||
+      body?.data?.phone ||
+      body?.phone ||
+      null;
+    const numeroCliente = telefoneBruto ? String(telefoneBruto).replace(/\D/g, '') : null;
+
+    if (!numeroCliente) {
+      console.error('❌ Não achei o telefone do cliente no payload da Cakto - não dá pra liberar automaticamente.');
+      await notificarAdmin(
+        'Pagamento Cakto sem telefone identificável',
+        'Um pagamento chegou no webhook, mas não consegui achar o número de telefone no JSON. Confira o log do Railway e libere manualmente com /liberar.'
+      );
+      return res.sendStatus(200);
+    }
+
+    const usuarioAlvo = await carregarUsuario(numeroCliente);
+    usuarioAlvo.assinatura = { ativa: true, ativadaEm: new Date().toISOString(), origem: 'cakto' };
+    await salvarUsuario(numeroCliente, usuarioAlvo);
+
+    await enviarTexto(
+      numeroCliente,
+      '✅ Pagamento confirmado! Sua assinatura do NutriZap está ativa - pode continuar mandando suas refeições normalmente. 🎉'
+    );
+
+    res.sendStatus(200);
+  } catch (erro) {
+    console.error('Erro processando webhook da Cakto:', erro.message);
+    await notificarAdmin('Erro no webhook da Cakto', erro.message || String(erro));
+    res.sendStatus(200); // sempre 200 pra Cakto não ficar reenviando em loop
+  }
+});
+
 // ---------- Rota que recebe os eventos de mensagem da Meta (webhook) ----------
 
 app.post('/webhook', async (req, res) => {
@@ -1107,10 +1246,29 @@ app.post('/webhook', async (req, res) => {
       mensagem.imageMessage?.caption ||
       '';
 
+    const comandoBruto = textoRecebido.trim();
+    const comando = comandoBruto.toLowerCase();
+
+    // Comando ADMIN (só funciona se a mensagem vier do seu próprio número
+    // pessoal, configurado em ADMIN_WHATSAPP_NUMERO) - libera manualmente um
+    // cliente que pagou, sem precisar esperar o webhook da Cakto estar
+    // pronto. Uso: /liberar 5522999999999
+    if (ADMIN_WHATSAPP_NUMERO && numero === ADMIN_WHATSAPP_NUMERO && comando.startsWith('/liberar')) {
+      const numeroAlvo = comandoBruto.slice('/liberar'.length).trim().replace(/\D/g, '');
+      if (!numeroAlvo) {
+        await enviarTexto(numero, '⚠️ Uso: */liberar 5522999999999* (número completo, só dígitos)');
+      } else {
+        const usuarioAlvo = await carregarUsuario(numeroAlvo);
+        usuarioAlvo.assinatura = { ativa: true, ativadaEm: new Date().toISOString(), origem: 'manual' };
+        await salvarUsuario(numeroAlvo, usuarioAlvo);
+        await enviarTexto(numero, `✅ Assinatura liberada manualmente pra *${numeroAlvo}*.`);
+      }
+      return;
+    }
+
     const usuario = await carregarUsuario(numero);
     const perfil = usuario.perfil;
     capturarNome(perfil, dados);
-    const comando = textoRecebido.trim().toLowerCase();
 
     // Primeira mensagem de um usuário totalmente novo: manda boas-vindas
     // com o nome dele em vez de já disparar a primeira pergunta "seca".
@@ -1171,7 +1329,8 @@ app.post('/webhook', async (req, res) => {
           '*/hoje* - resumo do dia\n' +
           '*/perfil* - ver suas metas\n' +
           '*/perfil refazer* - refazer a entrevista inicial\n' +
-          '*/nome SeuNome* - trocar como eu te chamo'
+          '*/nome SeuNome* - trocar como eu te chamo\n\n' +
+          `_Você pode registrar ${LIMITE_REFEICOES_TESTE} refeições grátis antes de assinar._`
       );
       await salvarUsuario(numero, usuario);
       return;
@@ -1225,6 +1384,17 @@ app.post('/webhook', async (req, res) => {
     }
 
     // --- Perfil já completo: fluxos especiais primeiro ---
+
+    // Trava do trial grátis: se já bateu o limite de refeições e ainda não
+    // assinou, para aqui e manda o link de pagamento em vez de gastar outra
+    // chamada de IA. Fica ANTES de tudo que analisa refeição nova, mas os
+    // comandos de sempre (/hoje, /perfil, /nome, /ajuda) já responderam lá
+    // em cima e nem chegam aqui.
+    if (passouDoLimiteTeste(usuario, numero)) {
+      await avisarLimiteTesteAtingido(numero);
+      await salvarUsuario(numero, usuario);
+      return;
+    }
 
     // Extrai a imagem (se tiver) JÁ AQUI NO INÍCIO, porque as checagens de
     // intenção (futuro/condicional) abaixo precisam saber se tem foto ou não,
