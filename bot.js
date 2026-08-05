@@ -1116,76 +1116,132 @@ app.get('/webhook', (req, res) => {
 
 // ---------- Rota que recebe a confirmação de pagamento da Cakto ----------
 //
-// 🚧 ESQUELETO - AINDA NÃO TESTADO COM UM PAYLOAD REAL DA CAKTO. 🚧
+// Formato confirmado na documentação oficial da API da Cakto
+// (docs.cakto.com.br - histórico de eventos de webhook). Exemplo real de
+// payload pra "purchase_approved":
 //
-// Ainda não temos o produto/checkout criado lá, então não sei o formato
-// exato que a Cakto manda. O que precisa acontecer antes de confiar nessa
-// rota de verdade:
-//   1. Criar o produto e o checkout no painel da Cakto
-//   2. Configurar um webhook lá apontando pra:
-//      https://SEU-DOMINIO-RAILWAY/webhook/cakto
-//   3. Fazer uma compra de teste (ou usar o "testar webhook" deles, se tiver)
-//   4. Copiar o JSON exato que chegou aqui e me mandar - eu ajusto os nomes
-//      de campo abaixo (hoje estou tentando alguns nomes prováveis, mas
-//      pode não bater exatamente com o que a Cakto realmente envia)
-//   5. Confirmar como a Cakto manda o "segredo" do webhook pra validar que a
-//      chamada é legítima (header customizado? query string? assinatura
-//      HMAC no corpo? cada plataforma faz diferente)
+// {
+//   "data": {
+//     "status": "paid",
+//     "customer": { "name": "...", "email": "...", "phone": "5534999999999" },
+//     "product": { "id": "...", "name": "...", "type": "subscription" },
+//     "amount": 29.9,
+//     "subscription": "...", // preenchido quando é produto de assinatura
+//     ...
+//   },
+//   "event": "purchase_approved",
+//   "secret": "8402b43f-c839-4090-bbd1-186725d185cd"  <- o segredo vem NO CORPO, não no header
+// }
 //
-// Até isso estar confirmado, o jeito seguro de liberar cliente é o comando
-// manual */liberar 5522999999999* que já está funcionando.
+// Três grupos de evento, tratados de formas diferentes:
+//
+// 1) LIBERA acesso: pagamento aprovado ou assinatura criada/renovada.
+// 2) REVOGA acesso na hora: reembolso ou chargeback (dinheiro voltou pro
+//    cliente, então o acesso tem que voltar também - senão é prejuízo puro),
+//    e cancelamento de assinatura (o cliente pediu pra parar).
+// 3) AVISA sem cortar na hora: falha na renovação (cartão recusado, Pix que
+//    não completou). Aqui a ideia é ser gentil primeiro - manda um aviso
+//    amigável com o link pra resolver, em vez de já cortar o acesso de
+//    quem só teve um problema pontual de pagamento.
+//
+// ⚠️ Não achei um evento específico de "MED" (Mecanismo Especial de
+// Devolução do Pix) na lista oficial de eventos da Cakto - minha melhor
+// suposição é que isso chega disfarçado de "refund" do lado da Cakto (é
+// assim que normalmente aparece pro recebedor). Se um dia acontecer um MED
+// de verdade, vale conferir no log se realmente caiu como "refund" ou se
+// veio de outro jeito, pra eu ajustar se for o caso.
+
+const EVENTOS_QUE_LIBERAM_ACESSO = ['purchase_approved', 'subscription_created', 'subscription_renewed'];
+const EVENTOS_QUE_REVOGAM_ACESSO = ['refund', 'chargeback', 'subscription_canceled'];
+const EVENTOS_DE_FALHA_RENOVACAO = ['subscription_renewal_refused'];
 
 app.post('/webhook/cakto', async (req, res) => {
   try {
-    // Validação básica de segredo compartilhado - AJUSTAR quando soubermos
-    // como a Cakto realmente manda essa validação (pode não ser um header
-    // "x-webhook-secret", isso é só um palpite razoável por enquanto).
-    if (CAKTO_WEBHOOK_SECRET && req.headers['x-webhook-secret'] !== CAKTO_WEBHOOK_SECRET) {
+    const body = req.body || {};
+
+    // O segredo vem DENTRO do corpo (campo "secret"), não em header - é
+    // assim que a Cakto documenta oficialmente.
+    if (CAKTO_WEBHOOK_SECRET && body.secret !== CAKTO_WEBHOOK_SECRET) {
       console.error('❌ Webhook da Cakto rejeitado - segredo não bateu.');
       return res.sendStatus(401);
     }
 
-    const body = req.body || {};
     console.log('📦 Payload recebido em /webhook/cakto:', JSON.stringify(body));
 
-    // Só processa se for um evento de pagamento aprovado. O nome exato do
-    // campo de status/evento PRECISA ser confirmado com um payload real.
-    const status = body?.event || body?.status || body?.data?.status;
-    const statusIndicaPago = /aprovad|paid|approved|pago/i.test(status || '');
-    if (!statusIndicaPago) {
-      console.log(`ℹ️  Evento da Cakto ignorado (status: "${status}") - não parece pagamento aprovado.`);
+    const evento = body?.event;
+    const ehLiberacao = EVENTOS_QUE_LIBERAM_ACESSO.includes(evento);
+    const ehRevogacao = EVENTOS_QUE_REVOGAM_ACESSO.includes(evento);
+    const ehFalhaRenovacao = EVENTOS_DE_FALHA_RENOVACAO.includes(evento);
+
+    if (!ehLiberacao && !ehRevogacao && !ehFalhaRenovacao) {
+      console.log(`ℹ️  Evento da Cakto ignorado ("${evento}") - não exige nenhuma ação do bot.`);
       return res.sendStatus(200);
     }
 
-    // Tenta achar o telefone do cliente em alguns caminhos prováveis do
-    // JSON. Isso também precisa ser confirmado/ajustado com o payload real -
-    // o telefone só vai vir se o campo de telefone existir no checkout e a
-    // pessoa preencher com o mesmo número que usa no WhatsApp do bot.
-    const telefoneBruto =
-      body?.data?.customer?.phone ||
-      body?.customer?.phone ||
-      body?.data?.phone ||
-      body?.phone ||
-      null;
-    const numeroCliente = telefoneBruto ? String(telefoneBruto).replace(/\D/g, '') : null;
+    const telefoneBruto = body?.data?.customer?.phone || null;
+    let numeroCliente = telefoneBruto ? String(telefoneBruto).replace(/\D/g, '') : null;
+
+    // A Cakto às vezes manda o telefone SEM o "55" do Brasil na frente (ex:
+    // "34999999999", 11 dígitos = DDD + número). Todo o resto do bot guarda
+    // o número COM o 55 (é assim que a Meta manda), então normalizamos aqui
+    // pra sempre bater com o que já está salvo no banco.
+    if (numeroCliente && !numeroCliente.startsWith('55') && numeroCliente.length <= 11) {
+      numeroCliente = '55' + numeroCliente;
+    }
 
     if (!numeroCliente) {
-      console.error('❌ Não achei o telefone do cliente no payload da Cakto - não dá pra liberar automaticamente.');
+      console.error('❌ Não achei o telefone do cliente no payload da Cakto - não dá pra agir automaticamente.');
       await notificarAdmin(
-        'Pagamento Cakto sem telefone identificável',
-        'Um pagamento chegou no webhook, mas não consegui achar o número de telefone no JSON. Confira o log do Railway e libere manualmente com /liberar.'
+        `Evento Cakto (${evento}) sem telefone identificável`,
+        'Confira o log do Railway e resolva manualmente (libere ou corte acesso com /liberar, se aplicável).'
       );
       return res.sendStatus(200);
     }
 
     const usuarioAlvo = await carregarUsuario(numeroCliente);
-    usuarioAlvo.assinatura = { ativa: true, ativadaEm: new Date().toISOString(), origem: 'cakto' };
-    await salvarUsuario(numeroCliente, usuarioAlvo);
 
-    await enviarTexto(
-      numeroCliente,
-      '✅ Pagamento confirmado! Sua assinatura do NutriZap está ativa - pode continuar mandando suas refeições normalmente. 🎉'
-    );
+    if (ehLiberacao) {
+      usuarioAlvo.assinatura = { ativa: true, ativadaEm: new Date().toISOString(), origem: 'cakto' };
+      await salvarUsuario(numeroCliente, usuarioAlvo);
+      await enviarTexto(
+        numeroCliente,
+        '✅ Pagamento confirmado! Sua assinatura do NutriZap está ativa - pode continuar mandando suas refeições normalmente. 🎉'
+      );
+    } else if (ehRevogacao) {
+      usuarioAlvo.assinatura = { ativa: false, ativadaEm: null, origem: null };
+      await salvarUsuario(numeroCliente, usuarioAlvo);
+
+      if (evento === 'subscription_canceled') {
+        await enviarTexto(
+          numeroCliente,
+          'Sua assinatura do NutriZap foi cancelada. Quando quiser voltar, é só assinar de novo por aqui: ' +
+            `${CAKTO_CHECKOUT_URL || '(link de assinatura)'}`
+        );
+      }
+      // Em reembolso/chargeback não mandamos mensagem pro cliente (evita
+      // soar acusatório) - só cortamos o acesso e avisamos você.
+      await notificarAdmin(
+        `Acesso revogado (${evento})`,
+        `Número ${numeroCliente} teve o acesso cortado automaticamente por causa de um evento "${evento}" na Cakto. ` +
+          (evento === 'refund' || evento === 'chargeback'
+            ? 'Vale conferir no painel da Cakto se foi um caso legítimo.'
+            : '')
+      );
+    } else if (ehFalhaRenovacao) {
+      // Não corta o acesso agora - só avisa com carinho e te dá visibilidade.
+      // Se quiser, no futuro dá pra evoluir isso pra um corte automático
+      // depois de X dias sem resolver, mas isso exigiria um job agendado
+      // (cron) revisando assinaturas periodicamente, que ainda não existe.
+      await enviarTexto(
+        numeroCliente,
+        '⚠️ A renovação da sua assinatura do NutriZap não foi processada (pode ter sido o cartão ou um problema no pagamento). ' +
+          `Pra continuar sem interrupção, atualiza por aqui: ${CAKTO_CHECKOUT_URL || '(link de assinatura)'} 🙏`
+      );
+      await notificarAdmin(
+        'Falha na renovação de assinatura',
+        `Número ${numeroCliente} teve uma tentativa de renovação recusada. Acesso NÃO foi cortado automaticamente - já mandei aviso amigável pro cliente.`
+      );
+    }
 
     res.sendStatus(200);
   } catch (erro) {
