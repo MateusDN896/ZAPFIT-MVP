@@ -1171,6 +1171,30 @@ async function notificarAdmin(tipo, detalhes) {
   }
 }
 
+// Notificação de lead novo - separada da notificarAdmin de propósito, porque
+// aquela tem cooldown de 15min por tipo (pra não floodar em caso de erro
+// repetido), o que faria leads diferentes chegando perto um do outro se
+// atropelarem e o segundo aviso sumir. Lead novo é raro o bastante (cada
+// número só dispara isso UMA vez, na vida) pra não precisar de cooldown.
+async function notificarNovoLead(numero) {
+  if (!ADMIN_WHATSAPP_NUMERO) return;
+  try {
+    const url = `https://graph.facebook.com/${META_API_VERSION}/${META_PHONE_NUMBER_ID}/messages`;
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${META_ACCESS_TOKEN}` },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to: ADMIN_WHATSAPP_NUMERO,
+        type: 'text',
+        text: { body: `🟢 *Lead novo no NutriZap!*\n\nNúmero: ${numero}` },
+      }),
+    });
+  } catch (erro) {
+    console.error('Não consegui notificar lead novo pro admin:', erro.message);
+  }
+}
+
 async function enviarTexto(numero, texto) {
   const url = `https://graph.facebook.com/${META_API_VERSION}/${META_PHONE_NUMBER_ID}/messages`;
   const resp = await fetch(url, {
@@ -1474,6 +1498,9 @@ app.post('/webhook', async (req, res) => {
     if (ehPrimeiraMensagem) {
       perfil.etapa = 'objetivo';
       await enviarTexto(numero, textoBoasVindas(perfil.nome));
+      if (!TESTADORES_ISENTOS.includes(numero)) {
+        await notificarNovoLead(numero);
+      }
       await salvarUsuario(numero, usuario);
       return;
     }
