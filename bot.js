@@ -190,6 +190,15 @@ async function salvarUsuario(numero, usuario) {
 
 // O WhatsApp manda o nome de exibição do contato (pushName) em toda
 // mensagem. Guardamos o primeiro nome pra poder chamar a pessoa por ele.
+// Formata um número (formato 55DDNNNNNNNNN, 13 dígitos) pra ficar legível
+// tipo "+55 34 99999-9999". Se não bater nesse padrão exato (número
+// estrangeiro, fixo, formato inesperado), devolve o número original sem
+// quebrar nada.
+function formatarNumeroExibicao(numero) {
+  const match = String(numero).match(/^55(\d{2})(\d{5})(\d{4})$/);
+  return match ? `+55 ${match[1]} ${match[2]}-${match[3]}` : numero;
+}
+
 function capturarNome(perfil, dadosWebhook) {
   if (!perfil.nome && dadosWebhook?.pushName) {
     perfil.nome = dadosWebhook.pushName.trim().split(' ')[0];
@@ -1545,7 +1554,7 @@ app.post('/webhook', async (req, res) => {
           hour: '2-digit',
           minute: '2-digit',
         }).format(linha.criado_em);
-        return `📌 ${horario}\n${nome}\n${linha.numero}`;
+        return `📌 ${horario}\n${nome}\n${formatarNumeroExibicao(linha.numero)}\nhttps://wa.me/${linha.numero}`;
       });
 
       // Espaço em branco entre cada entrada (linha vazia), pra não ficar
@@ -1578,7 +1587,7 @@ app.post('/webhook', async (req, res) => {
           hour: '2-digit',
           minute: '2-digit',
         }).format(linha.criado_em);
-        return `📌 ${horario}\n${nome}\n${linha.numero}`;
+        return `📌 ${horario}\n${nome}\n${formatarNumeroExibicao(linha.numero)}\nhttps://wa.me/${linha.numero}`;
       });
 
       await enviarTexto(numero, `📋 *Histórico completo (${resultado.rows.length} registros):*\n\n${linhas.join('\n\n')}`);
