@@ -1516,19 +1516,23 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // Comando ADMIN pra consultar quem entrou em contato recentemente - serve
-    // de "rede de segurança" caso a notificação de lead novo ao vivo falhe
-    // por algum motivo (instabilidade da Meta, etc). Uso: /leads (mostra os
-    // últimos 10) ou /leads 20 (mostra os últimos 20).
+    // Comando ADMIN pra consultar LEADS DE VERDADE (número válido, formato
+    // atual da Meta) - serve de "rede de segurança" caso a notificação de
+    // lead novo ao vivo falhe. Filtra fora qualquer número que não seja só
+    // dígitos (isso descarta lixo antigo da época da Evolution API, tipo
+    // "5521999999999@s.whatsapp.net", que não são leads de verdade sob o
+    // sistema atual). Uso: /leads (últimos 10) ou /leads 20.
     if (ADMIN_WHATSAPP_NUMERO && numero === ADMIN_WHATSAPP_NUMERO && comando.startsWith('/leads')) {
       const quantidade = Math.min(Number(comandoBruto.slice('/leads'.length).trim()) || 10, 50);
       const resultado = await pool.query(
-        `SELECT numero, dados, criado_em FROM usuarios ORDER BY criado_em DESC LIMIT $1`,
+        `SELECT numero, dados, criado_em FROM usuarios
+         WHERE numero ~ '^[0-9]+$'
+         ORDER BY criado_em DESC LIMIT $1`,
         [quantidade]
       );
 
       if (resultado.rows.length === 0) {
-        await enviarTexto(numero, 'Nenhum contato registrado ainda.');
+        await enviarTexto(numero, 'Nenhum lead registrado ainda.');
         return;
       }
 
@@ -1541,10 +1545,43 @@ app.post('/webhook', async (req, res) => {
           hour: '2-digit',
           minute: '2-digit',
         }).format(linha.criado_em);
-        return `• ${horario} - ${nome} - ${linha.numero}`;
+        return `📌 ${horario}\n${nome}\n${linha.numero}`;
       });
 
-      await enviarTexto(numero, `📋 *Últimos ${resultado.rows.length} contatos:*\n\n${linhas.join('\n')}`);
+      // Espaço em branco entre cada entrada (linha vazia), pra não ficar
+      // tudo grudado e difícil de escanear visualmente.
+      await enviarTexto(numero, `📋 *Últimos ${resultado.rows.length} leads:*\n\n${linhas.join('\n\n')}`);
+      return;
+    }
+
+    // /historico - igual ao /leads, mas SEM o filtro de número válido. Só
+    // pra investigar/auditar dado antigo quando precisar, não é o uso do
+    // dia a dia (esse é o /leads).
+    if (ADMIN_WHATSAPP_NUMERO && numero === ADMIN_WHATSAPP_NUMERO && comando.startsWith('/historico')) {
+      const quantidade = Math.min(Number(comandoBruto.slice('/historico'.length).trim()) || 10, 50);
+      const resultado = await pool.query(
+        `SELECT numero, dados, criado_em FROM usuarios ORDER BY criado_em DESC LIMIT $1`,
+        [quantidade]
+      );
+
+      if (resultado.rows.length === 0) {
+        await enviarTexto(numero, 'Nenhum registro no banco ainda.');
+        return;
+      }
+
+      const linhas = resultado.rows.map((linha) => {
+        const nome = linha.dados?.perfil?.nome || '(sem nome)';
+        const horario = new Intl.DateTimeFormat('pt-BR', {
+          timeZone: 'America/Sao_Paulo',
+          day: '2-digit',
+          month: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+        }).format(linha.criado_em);
+        return `📌 ${horario}\n${nome}\n${linha.numero}`;
+      });
+
+      await enviarTexto(numero, `📋 *Histórico completo (${resultado.rows.length} registros):*\n\n${linhas.join('\n\n')}`);
       return;
     }
 
