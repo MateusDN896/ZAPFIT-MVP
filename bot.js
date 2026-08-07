@@ -118,9 +118,13 @@ async function garantirTabela() {
     CREATE TABLE IF NOT EXISTS usuarios (
       numero TEXT PRIMARY KEY,
       dados JSONB NOT NULL,
+      criado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
       atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // Garante a coluna também em bancos que já existiam antes dessa mudança
+  // (CREATE TABLE IF NOT EXISTS não adiciona coluna nova a tabela já criada).
+  await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS criado_em TIMESTAMPTZ NOT NULL DEFAULT now();`);
 
   // A Meta reenvia a MESMA mensagem se o webhook demorar pra responder (ou
   // em qualquer instabilidade de rede) - sem isso, uma foto podia ser
@@ -173,6 +177,9 @@ async function carregarUsuario(numero) {
 }
 
 async function salvarUsuario(numero, usuario) {
+  // criado_em só é definido no INSERT (primeira vez) - o ON CONFLICT
+  // propositalmente NÃO mexe nele, então ele sempre representa o momento
+  // real da primeira mensagem dessa pessoa, nunca é sobrescrito depois.
   await pool.query(
     `INSERT INTO usuarios (numero, dados, atualizado_em)
      VALUES ($1, $2, now())
@@ -1176,22 +1183,43 @@ async function notificarAdmin(tipo, detalhes) {
 // repetido), o que faria leads diferentes chegando perto um do outro se
 // atropelarem e o segundo aviso sumir. Lead novo é raro o bastante (cada
 // número só dispara isso UMA vez, na vida) pra não precisar de cooldown.
-async function notificarNovoLead(numero) {
-  if (!ADMIN_WHATSAPP_NUMERO) return;
+async function notificarNovoLead(numero, nome) {
+  if (!ADMIN_WHATSAPP_NUMERO) {
+    console.error('⚠️ ADMIN_WHATSAPP_NUMERO não configurado - notificação de lead novo não foi enviada.');
+    return;
+  }
   try {
+    const agora = new Intl.DateTimeFormat('pt-BR', {
+      timeZone: 'America/Sao_Paulo',
+      day: '2-digit',
+      month: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date());
+    const nomeExibido = nome ? nome : '(sem nome no WhatsApp)';
     const url = `https://graph.facebook.com/${META_API_VERSION}/${META_PHONE_NUMBER_ID}/messages`;
-    await fetch(url, {
+    const resp = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${META_ACCESS_TOKEN}` },
       body: JSON.stringify({
         messaging_product: 'whatsapp',
         to: ADMIN_WHATSAPP_NUMERO,
         type: 'text',
-        text: { body: `🟢 *Lead novo no NutriZap!*\n\nNúmero: ${numero}` },
+        text: {
+          body: `🟢 *Lead novo no NutriZap!*\n\nNome: ${nomeExibido}\nNúmero: ${numero}\nEntrou em: ${agora}`,
+        },
       }),
     });
+
+    if (!resp.ok) {
+      const erro = await resp.text();
+      // Não chama notificarAdmin aqui - ela manda pro MESMO número que
+      // acabou de falhar, então cairia no mesmo problema. O log do
+      // Railway é o único lugar confiável pra registrar essa falha.
+      console.error('❌ Falha ao notificar lead novo (Meta recusou o envio):', resp.status, erro.slice(0, 300));
+    }
   } catch (erro) {
-    console.error('Não consegui notificar lead novo pro admin:', erro.message);
+    console.error('❌ Não consegui notificar lead novo pro admin (erro de rede):', erro.message);
   }
 }
 
@@ -1488,6 +1516,38 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
+    // Comando ADMIN pra consultar quem entrou em contato recentemente - serve
+    // de "rede de segurança" caso a notificação de lead novo ao vivo falhe
+    // por algum motivo (instabilidade da Meta, etc). Uso: /leads (mostra os
+    // últimos 10) ou /leads 20 (mostra os últimos 20).
+    if (ADMIN_WHATSAPP_NUMERO && numero === ADMIN_WHATSAPP_NUMERO && comando.startsWith('/leads')) {
+      const quantidade = Math.min(Number(comandoBruto.slice('/leads'.length).trim()) || 10, 50);
+      const resultado = await pool.query(
+        `SELECT numero, dados, criado_em FROM usuarios ORDER BY criado_em DESC LIMIT $1`,
+        [quantidade]
+      );
+
+      if (resultado.rows.length === 0) {
+        await enviarTexto(numero, 'Nenhum contato registrado ainda.');
+        return;
+      }
+
+      const linhas = resultado.rows.map((linha) => {
+        const nome = linha.dados?.perfil?.nome || '(sem nome)';
+        const horario = new Intl.DateTimeFormat('pt-BR', {
+          timeZone: 'America/Sao_Paulo',
+          day: '2-digit',
+          month: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+        }).format(linha.criado_em);
+        return `• ${horario} - ${nome} - ${linha.numero}`;
+      });
+
+      await enviarTexto(numero, `📋 *Últimos ${resultado.rows.length} contatos:*\n\n${linhas.join('\n')}`);
+      return;
+    }
+
     const usuario = await carregarUsuario(numero);
     const perfil = usuario.perfil;
     capturarNome(perfil, dados);
@@ -1499,7 +1559,7 @@ app.post('/webhook', async (req, res) => {
       perfil.etapa = 'objetivo';
       await enviarTexto(numero, textoBoasVindas(perfil.nome));
       if (!TESTADORES_ISENTOS.includes(numero)) {
-        await notificarNovoLead(numero);
+        await notificarNovoLead(numero, perfil.nome);
       }
       await salvarUsuario(numero, usuario);
       return;
