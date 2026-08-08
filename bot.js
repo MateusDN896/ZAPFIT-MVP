@@ -1594,6 +1594,71 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
+    // /acompanhar 5522999999999 - mostra até onde um lead específico chegou:
+    // etapa do cadastro, quantas refeições grátis já usou, se já assinou.
+    if (ADMIN_WHATSAPP_NUMERO && numero === ADMIN_WHATSAPP_NUMERO && comando.startsWith('/acompanhar')) {
+      const numeroAlvo = comandoBruto.slice('/acompanhar'.length).trim().replace(/\D/g, '');
+      if (!numeroAlvo) {
+        await enviarTexto(numero, '⚠️ Uso: */acompanhar 5522999999999* (número completo, só dígitos)');
+        return;
+      }
+
+      const resultado = await pool.query(
+        `SELECT dados, criado_em, atualizado_em FROM usuarios WHERE numero = $1`,
+        [numeroAlvo]
+      );
+
+      if (resultado.rows.length === 0) {
+        await enviarTexto(numero, `Não achei nenhum registro pra ${formatarNumeroExibicao(numeroAlvo)}.`);
+        return;
+      }
+
+      const linha = resultado.rows[0];
+      const dadosAlvo = linha.dados || {};
+      const perfilAlvo = dadosAlvo.perfil || {};
+      const nomeAlvo = perfilAlvo.nome || '(sem nome)';
+      const qtdRefeicoes = (dadosAlvo.refeicoes || []).length;
+      const qtdAtividades = (dadosAlvo.atividades || []).length;
+
+      const formatarData = (d) =>
+        new Intl.DateTimeFormat('pt-BR', {
+          timeZone: 'America/Sao_Paulo',
+          day: '2-digit',
+          month: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+        }).format(d);
+
+      let statusCadastro;
+      if (!perfilAlvo.completo) {
+        statusCadastro = perfilAlvo.etapa ? `Em andamento (parou na etapa "${perfilAlvo.etapa}")` : 'Ainda não começou';
+      } else {
+        statusCadastro = '✅ Completo';
+      }
+
+      let statusTrialOuAssinatura;
+      if (dadosAlvo.assinatura?.ativa) {
+        statusTrialOuAssinatura = `✅ Assinante ativo desde ${formatarData(new Date(dadosAlvo.assinatura.ativadaEm))} (origem: ${dadosAlvo.assinatura.origem || 'desconhecida'})`;
+      } else if (TESTADORES_ISENTOS.includes(numeroAlvo)) {
+        statusTrialOuAssinatura = '🔓 Testador isento (nunca é cobrado)';
+      } else {
+        statusTrialOuAssinatura = `${qtdRefeicoes}/${LIMITE_REFEICOES_TESTE} refeições grátis usadas`;
+      }
+
+      const mensagem =
+        `📊 *Acompanhamento: ${nomeAlvo}*\n\n` +
+        `Número: ${formatarNumeroExibicao(numeroAlvo)}\n` +
+        `Entrou em: ${formatarData(linha.criado_em)}\n` +
+        `Última atividade: ${formatarData(linha.atualizado_em)}\n\n` +
+        `Cadastro: ${statusCadastro}\n` +
+        `Situação: ${statusTrialOuAssinatura}\n` +
+        `Refeições registradas: ${qtdRefeicoes}\n` +
+        `Atividades físicas registradas: ${qtdAtividades}`;
+
+      await enviarTexto(numero, mensagem);
+      return;
+    }
+
     const usuario = await carregarUsuario(numero);
     const perfil = usuario.perfil;
     capturarNome(perfil, dados);
